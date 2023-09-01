@@ -1,0 +1,671 @@
+---
+title: "ParSE Main Analysis"
+author: "Matthew O'Neill"
+date: "1/2/2023"
+output: html_document
+---
+
+# ParSE-seq Data Processing
+
+## Here we present a method to determine the splice-altering consequences of cis-genetic variation. We calculate barcode counts, assembly reads, and Percent Spliced In (PSI) using bash and python scripting in Unix, and then analyze these data in a series of RMDs presented here to input to the Main Analyses RMD to generate figures for the manuscript. 
+
+
+# ParSE-seq Early Processing 
+
+## Step 1 - Check assembly barcode counts by PacBio and Illumina sequencing
+## Step 2 - Assign assembly barcodes to unique Twist inserts
+## Step 3 - Analyze assay barcode counts from iPSC-CMs
+## Step 4 - Calculate PSI associated with assay barcodes 
+
+```{r setup, include=FALSE}
+# Import libraries 
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(spgs)
+library(ggpubr)
+library(pROC)
+library(GGally)
+library(reshape2)
+
+```
+
+# Step 1
+
+## Analyze Barcodes from PacBio long read Assembly
+
+### We sequenced amplicons with a forward primer positioned before the Twist insert and the reverse primer immediately flanking the barcode region (Figure 2A). This configuration would allow us to count how many barcodes were associated with each insert using Long Read NGS and assess library diversity. Barcodes were parsed from individual FASTQ files in Unix and then counted in R. They were then fed back into Unix to sort FASTQ files based on unique barcodes and then to assign barcodes to the unique Twist inserts that made up our library. 
+
+```{r, include = TRUE}
+# Read barcode file 
+
+bc_pacbio <- fread("Full_Assembly_uniform_BCs_counted_combined.txt", header=F, stringsAsFactors = F)
+
+names(bc_pacbio) <- c("barcode", "count_PB")
+
+summary(bc_pacbio$count_PB) # median 1, mean 112
+sum(bc_pacbio$count_PB) # 1867171
+
+sum(bc_pacbio$count_PB>100) #3184
+sum(bc_pacbio$count_PB>10^1.6) #3323
+sum(bc_pacbio$count_PB>50) #3303
+
+bc_pacbio <- bc_pacbio[bc_pacbio$count_PB > 50, ]
+
+# Export files for Loretta
+
+# verbose
+PB_list_full_v1_verbose <- bc_pacbio[,c("barcode", "count_PB")]
+write.table(PB_list_full_v1_verbose,'PB_list_full_v1_verbose.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+# barcode only
+PB_list_full_v1_barcodeonly <- bc_pacbio[,c("barcode")]
+write.table(PB_list_full_v1_barcodeonly,'PB_list_full_v1_barcodeonly.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+# barcode list
+PB_list_full_v1_barcodelist <- bc_pacbio[,c("barcode", "count_PB")]
+write.table(PB_list_full_v1_barcodelist, 'PB_list_full_v1_barcodelist.txt', quote=FALSE, row.names=FALSE)
+
+
+```
+
+
+## Analyze Assembly barcodes by Illumina short read sequencing
+
+### To ensure compatability among sequencing technologies, and for our own reassurement, we also analyzed pre-assay barcode counts by Illumina short read sequencing. The forward primer is in the pAG424 intronic segment with the reverse primer immediately flanking the barcode site - no insert sequence is present in the amplicon. 
+
+```{r, include = TRUE}
+
+# Read barcode file 
+bc_illumina <- fread("Right_barcode_counts_9402.txt", header=F, stringsAsFactors = F)
+
+summary(bc_illumina$V1) # median 1, mean 44
+sum(bc_illumina$V1) # 26833562
+
+# Check counts
+sum(bc_illumina$V1>1000) #8885
+sum(bc_illumina$V1>10^1.6) #14707
+sum(bc_illumina$V1>40) #14656
+
+names(bc_illumina) <- c("count_illumina", "barcode")
+bc_illumina <- bc_illumina[bc_illumina$count_illumina > 50, ]
+#bc_illumina = bc_illumina.drop_duplicates(subset='barcode', keep='last')
+bc_illumina <- bc_illumina[!duplicated(bc_illumina[,c('barcode')]),]
+hist(bc_illumina$count_illumina, breaks = 20)
+
+```
+
+
+## Compare BC distribution by Illumina and PacBio - overlap and intersections
+
+```{r, inclue = TRUE}
+
+# Compare the barcode abundance for the Assembly using 2 different sequencing technologies
+# This generates the data for Supplemental Figure III
+
+bc_combined <- merge(bc_illumina, bc_pacbio, by = "barcode")
+bc_combined$logillumina <- (log10(bc_combined$count_illumina) + 1)
+bc_combined$logPB <- (log10(bc_combined$count_PB) + 1)
+p <- ggscatter(bc_combined, x = "logillumina", y = "logPB", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Log Illumina Count", ylab = "Log PacBio Count")
+ggpar(p, xlim = c(2,6), ylim = c(2,6))
+model=lm(bc_combined$logillumina~bc_combined$logPB)  
+summary(model)$coefficients[,4] 
+      
+```
+
+
+# Step 2 
+
+## Assembly - assign barcode to each Twist clonal gene insert
+
+### Here we assign each barcode to a unique Twist insert. We were cautious to control for PCR-mediated recombination, wherein the barcode may be incorrectly assigned to a different variant during elongation of highly homologous insert sequences bearing unique variants. We demonstrate this was a minimal concern after optimizing experimental conditions to reduce cycle number, and show high specificity for the assigned insert. 
+
+```{r, include = TRUE}
+
+# Import processed assembly file
+
+assembly_full <- fread("Assembly_full.txt", header=F, stringsAsFactors = F)
+
+# Trim values for processing and normalize read counts
+
+assembly_full$V316 <- substr(assembly_full$V316, 8, 25)
+assembly_full$V1 <- as.integer(substr(assembly_full$V1, 2, nchar(assembly_full$V1)))
+assembly_norm <- assembly_full
+for(i in 1:314){
+  #print(i)
+  assembly_norm[[i]] <- assembly_norm[[i]]/assembly_norm[[315]]
+}
+
+```
+
+```{r, include = FALSE}
+assembly_norm$ID <- "test"
+as.character(assembly_norm$ID)
+
+```
+
+
+### Assign barcodes to unique Twist inserts
+
+```{r}
+
+for(i in 1:3303){
+  value <- (max(assembly_norm[i,1:314]))
+  if(value > 0.5){
+    assembly_norm[i,"ID"] <- colnames(assembly_norm)[apply(assembly_norm[i,1:314],1,which.max)]
+  }
+    else{
+      assembly_norm[i, "ID"] <- NA
+    }
+  }
+
+# Remove low quality barcodes
+
+colnames(assembly_norm)[316] <- "Barcode"
+assembly_norm <- assembly_norm[complete.cases(ID), ] 
+
+# Analyze distribution of assignments - minimal PCR mediated recombination
+
+for (i in 500:502){
+  tmp <- as.vector(assembly_norm[i,])
+  #print(tmp)
+  tmp <- tmp[,1:314]
+  tmp <- as.numeric(tmp)
+  barplot(tmp, axisnames = TRUE, xlab = "Construct", main = i)
+}
+
+# Save data
+
+save(assembly_norm, file = "assembly_norm.RData")
+
+```
+
+
+# Step 3A
+
+## Splicing in iPSC-CM - Experiments 9419-4 to 9419-6 (3 iPSC-CM replicates)
+
+### Here we take processed data from Unix in which barcodes among 3 biological replicates were counted. We look for overlapping barcodes among each replicate, and then export a list of barcodes that are used to parse FASTQ files for PSI calculations in the subsequent step. 
+
+```{r, include = TRUE}
+
+# Analyze barcode counts after processing raw FASTQs in Unix (pipeline in Supplemental Figure XXX)
+
+bc1 <- fread("Right_combined_barcode_counts_9419-4_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc1) <- c("barcode", "count1")
+summary(bc1$count1) # median 1, mean 121
+sum(bc1$count1) # 16700122
+
+sum(bc1$count1>100) #2925
+sum(bc1$count1>10^1.6) #4519
+sum(bc1$count1>10) #10203
+sum(bc1$count1>5) #16045
+sum(bc1$count1>3) #22097
+bc1 <- bc1[bc1$count1 > 25, ]
+
+# Second replicate 
+
+bc2 <- fread("Right_combined_barcode_counts_9419-5_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc2) <- c("barcode", "count2")
+summary(bc2$count2) # median 1, mean 126.8
+sum(bc2$count2) # 19098237
+
+sum(bc2$count2>100) #2972
+sum(bc2$count2>10^1.6) #4954
+sum(bc2$count2>10) #11649
+sum(bc2$count2>5) #17825
+sum(bc2$count2>3) #26264
+bc2 <- bc2[bc2$count2 > 25, ]
+
+# Third replicate 
+
+bc3 <- fread("Right_combined_barcode_counts_9419-6_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc3) <- c("barcode", "count3")
+summary(bc3$count3) # median 1, mean 141
+sum(bc3$count3) # 18588321
+
+sum(bc3$count3>100) #2529
+sum(bc3$count3>10^1.6) #4238
+sum(bc3$count3>10) #10163
+sum(bc3$count3>5) #15478
+sum(bc3$count3>3) #21025
+bc3 <- bc3[bc3$count3 > 25, ]
+
+
+# Merge dataframes - now just do 1 and 3
+
+bc_all <- merge(bc1, bc3, all = TRUE)
+bc_all <- merge(bc_all, bc2, all = TRUE)
+bc_all <- bc_all[complete.cases(bc_all), ] 
+bc_all$count_sum <- bc_all$count1 + bc_all$count2 + bc_all$count3
+bc_all <- bc_all[bc_all$count_sum > 50, ]
+
+bc_merged_CM_v2 <- merge(bc_all, bc_pacbio) 
+
+
+plot(log10(bc_all$count1),log10(bc_all$count2),main='1 vs 2',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+plot(log10(bc_all$count1),log10(bc_all$count3),main='1 vs 3',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+plot(log10(bc_all$count2),log10(bc_all$count3),main='2 vs 3',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+
+# Re-write barcode files for parsing files and calculating PSI
+
+#verbose
+bc_list_full_CM_verbose_v2 <- bc_all[,c("barcode", "count_sum", "count1", "count2", "count3")]
+write.table(bc_list_full_CM_verbose_v2,'bc_list_full_CM_verbose_v2.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#barcode only
+bc_list_full_CM_barcodeonly_v2 <- bc_all[,c("barcode")]
+write.table(bc_list_full_CM_barcodeonly_v2,'bc_list_full_CM_barcodeonly_v2.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#barcode list
+bc_list_full_CM_barcodelist_v2 <- bc_all[,c("barcode", "count_sum")]
+write.table(bc_list_full_CM_barcodelist_v2, 'bc_list_full_CM_barcodelist_v2.txt', quote=FALSE, row.names=FALSE)
+
+# Create unique file from processed data
+
+reads <- fread("9419_4-6_unique_barcode_list_v2.txt", header=F, stringsAsFactors = F)
+reads <- as.data.frame(reads$V1)
+write.table(reads, '9419_4-6_unique_barcode_Only_v2.txt', quote=FALSE, row.names=FALSE)
+
+
+```
+
+
+# Step 4
+
+## iPSC-CM PSI calculations
+
+### The following provides the main output of our assay. We calculate PSI from splice junctions associated with each construct that were quantified per barcode in Unix. We assign each barcode to the unique Twist insert using the Assembly data. We use those IDs to call the relevant splice junctions, accounting for coding variants that need to be explicitly accounted for in this analysis. We repeat this for all 3 replicates and collapse barcodes by variant. We then determine the difference in PSI vs respective WT insert, and perform statistical tests to call a normal vs abnormal result.  
+
+
+```{r, include = TRUE}
+
+# Compare PSI's across replicates - updated with fixed replicates 2/16/2023
+
+PSI_4 <- fread("9419-4_PSI_v5.txt", header=F, stringsAsFactors = F)
+PSI_5 <- fread("9419-5_PSI_v5.txt", header=F, stringsAsFactors = F)
+PSI_6 <- fread("9419-6_PSI_v5.txt", header=F, stringsAsFactors = F)
+
+
+# Replicate 4
+
+colnames(PSI_4) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_4$Barcode <- substr(PSI_4$Barcode, 8, 25)
+PSI_4$`5_for` <- as.integer(substr(PSI_4$`5_for`, 2, nchar(PSI_4$`5_for`)))
+
+PSI_4 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_4 <- as.data.frame(PSI_4 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_4$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_4[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_4[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_4 <- PSI_4[complete.cases(PSI_4$ID), ] #927
+
+# Create PSI column
+
+PSI_4$PSI <- NA
+
+# Load indices
+
+pairs_full_4 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_4$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_4[i, 1]
+  tmp2 <- pairs_full_4[i, 2]
+  tmp3 <- pairs_full_4[i, 3]
+  tmp4 <- pairs_full_4[i, 4]
+  test_data <- PSI_4[PSI_4$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_4[n, "ID"] == tmp2){
+      PSI_4[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+# Replicate 5
+
+colnames(PSI_5) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_5$Barcode <- substr(PSI_5$Barcode, 8, 25)
+PSI_5$`5_for` <- as.integer(substr(PSI_5$`5_for`, 2, nchar(PSI_5$`5_for`)))
+
+PSI_5 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_5 <- as.data.frame(PSI_5 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_5$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_5[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_5[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_5 <- PSI_5[complete.cases(PSI_5$ID), ] 
+
+# Create PSI column
+
+PSI_5$PSI <- NA
+
+# Load indices
+
+pairs_full_5 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_5$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_5[i, 1]
+  tmp2 <- pairs_full_5[i, 2]
+  #print(tmp2)
+  tmp3 <- pairs_full_5[i, 3]
+  tmp4 <- pairs_full_5[i, 4]
+  test_data <- PSI_5[PSI_5$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_5[n, "ID"] == tmp2){
+      PSI_5[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+# Replicate 6
+
+colnames(PSI_6) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_6$Barcode <- substr(PSI_6$Barcode, 8, 25)
+PSI_6$`5_for` <- as.integer(substr(PSI_6$`5_for`, 2, nchar(PSI_6$`5_for`)))
+
+PSI_6 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_6 <- as.data.frame(PSI_6 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_6$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_6[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_6[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_6 <- PSI_6[complete.cases(PSI_6$ID), ] 
+
+# Create PSI column
+
+PSI_6$PSI <- NA
+
+# Load indices
+
+pairs_full_6 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_6$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_6[i, 1]
+  tmp2 <- pairs_full_6[i, 2]
+  tmp3 <- pairs_full_6[i, 3]
+  tmp4 <- pairs_full_6[i, 4]
+  test_data <- PSI_6[PSI_6$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_6[n, "ID"] == tmp2){
+      PSI_6[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+
+# PSI summaries - update on 2/16/2023 - v3
+
+save(assembly_norm, PSI_4, PSI_5, PSI_6, file = "PSI_sum_CM_v3.RData")
+
+
+# Create new dataframe with barcodes and PSI for all 3 replicates - just want ID and PSI
+
+PSI_4_data <- PSI_4[,c("ID", "PSI")]
+PSI_4_data <- unique(PSI_4_data)
+colnames(PSI_4_data) <- c("ID", "PSI_4")
+PSI_5_data <- PSI_5[,c("ID", "PSI")]
+PSI_5_data <- unique(PSI_5_data)
+colnames(PSI_5_data) <- c("ID", "PSI_5")
+PSI_6_data <- PSI_6[,c("ID", "PSI")]
+PSI_6_data <- unique(PSI_6_data)
+colnames(PSI_6_data) <- c("ID", "PSI_6")
+
+PSI_summary <- merge(PSI_4_data, PSI_5_data)
+PSI_summary <- merge(PSI_summary, PSI_6_data)
+PSI_summary <- na.omit(PSI_summary)
+
+cor(PSI_summary$PSI_4, PSI_summary$PSI_5, method = "pearson")
+
+ggscatter(PSI_summary, x = "PSI_4", y = "PSI_5", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 1 PSI", ylab = "Replicate 2 PSI")
+
+ggscatter(PSI_summary, x = "PSI_4", y = "PSI_6", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 1 PSI", ylab = "Replicate 3 PSI")
+
+ggscatter(PSI_summary, x = "PSI_5", y = "PSI_6", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 2 PSI", ylab = "Replicate 3 PSI")
+
+
+# Perform summary statistics of the available barcodes - PSI, delta_PSI, norm_delta_PSI, p-value
+
+# Now perform statistical test between variant and WT and Variant and report results
+
+stat_result <- c()
+delta_psi <- c()
+delta_psi_norm <- c()
+
+# Subset pairs by the reads that we have in the dataset - then no error 
+
+PSI_summary$p_value <- NA
+pairs_full <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_filtered <- subset(pairs_full, variants %in% PSI_summary$ID)
+PSI_summary$delta_psi <- 0
+PSI_summary$delta_psi_norm <- 0
+for (i in 1:238){
+  tmp1 <- pairs_full_filtered[i, 1]
+  tmp2 <- pairs_full_filtered[i, 2]
+  test_data <- PSI_summary[PSI_summary$ID == tmp1| PSI_summary$ID == tmp2, ]
+  stat_result[i] <- t.test(test_data[test_data$ID == tmp1, 2:4], test_data[test_data$ID == tmp2, 2:4])$p.value
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "p_value"] <- stat_result[i]
+    }
+  }
+  delta_psi[i] <- (mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')) - mean(as.vector(test_data[test_data$ID == tmp2, 2:4], mode='numeric')))
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "delta_psi"] <- delta_psi[i]
+    }
+  }
+  delta_psi_norm[i] <- ((mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')) - mean(as.vector(test_data[test_data$ID == tmp2, 2:4], mode='numeric'))) / mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')))
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "delta_psi_norm"] <- delta_psi_norm[i]
+    }
+  }
+}
+
+# Plot delta_psi vs p-value to gain intuition about significant effect size 
+
+plot(abs(PSI_summary$delta_psi), PSI_summary$p_value)
+abline(h=0.05,col='red')
+abline(v=0.20,col='red')
+
+# Make as a volcano plot
+
+plot(PSI_summary$delta_psi, -log10(PSI_summary$p_value), xlim = c(-1, 1))
+abline(h=-log10(0.05),col='red')
+abline(v=0.20,col='red')
+abline(v=-0.20, col='red')
+
+# Update files
+
+write.csv(PSI_summary, 'PSI_CM_summary_v2.csv')
+save(PSI_summary, file = "checkpoint_CM_v3.Rdata")
+
+
+# Add standard error to replicates
+
+PSI_summary$standard_error <- NA
+for(n in 1:length(PSI_summary$ID)){
+  x <- as.vector(PSI_summary[n, 2:4])
+  standard_error <- sd(x)/sqrt(3)
+  print(standard_error)
+  PSI_summary[n, 8] <- standard_error
+}
+
+hist(PSI_summary$standard_error, breaks = 100, xlim=c(0,0.30))
+
+# ggpairs visualization of replicate correlation for Supplemental Figure V
+
+PSI_summary <- PSI_summary[PSI_summary$standard_error < 0.15, ]
+
+ggpairs(PSI_summary, 
+        columns = c("PSI_4", "PSI_5", "PSI_6"), c("Replicate 1","Replicate 2","Replicate 3"))
+
+write.csv(PSI_summary, 'PSI_CM_summary_v3.csv')
+save(PSI_summary, file = "checkpoint_CM_v4.Rdata")
+
+
+# Visualize counts from assembly and assay for Figure 2C and 2D
+
+counts <- read.csv("parse_barcode_counts_analysis.csv", header = TRUE)
+barplot(counts$Barcodes)
+barplot(counts$Constructs)
+
+```
+
+## We then use these datasets in the 'ParSE-seq Main Analyses' RMD to generate additional figures for the manuscript and explore the data obtained from our targeted RNA-seq experiment. 
