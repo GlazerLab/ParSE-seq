@@ -1,0 +1,349 @@
+---
+title: "ParSE - Analyses v1"
+author: "Matthew O'Neill"
+date: "8/6/2023"
+output: html_document
+---
+
+# ParSE-seq Main Analyses 
+
+## Here we present a method to determine the splice-altering consequences of cis-genetic variation. We calculate barcode counts, assembly reads, and Percent Spliced In (PSI) using bash and python scripting in Unix, and then analyze these data in a series of RMDs presented here. These provide the raw data for the figures presented in the main text. 
+
+# ParSE-seq Main Analysis
+
+## Step 1 - Analyze ParSE-seq splicing results across the library
+## Step 2 - Compare experimental data with SpliceAI predictions
+## Step 3 - Calibrate assay to controls and interpet variants based on calibrated strenght of evidence
+## Step 4 - Analyze missense variants with complementary assays and predictors
+
+
+```{r setup, include=FALSE}
+# Import libraries 
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(spgs)
+library(ggpubr)
+library(pROC)
+library(GGally)
+library(reshape2)
+
+```
+
+
+# Step 1
+
+## Analyze results using splicing data and variant info from the Early Processing RMD
+
+```{r}
+
+# Merge variant information and splicing data 
+
+PSI_summary <- read.csv('PSI_CM_summary_v3.csv')
+twist_library <- read.csv("parse_twist_summary_v4.csv")
+analysis <- merge(PSI_summary, twist_library, by="ID")
+
+
+# Assign normal/abnormal based off of biological and statistical signifiance 
+
+analysis$FDR <- p.adjust(analysis$p_value, method = "fdr", n = length(analysis$p_value))
+analysis$patho <- NA
+analysis$patho[analysis$FDR >= 0.1 & analysis$delta_psi_norm < 0.2] <- 0
+analysis$patho[analysis$FDR < 0.1 & analysis$delta_psi_norm > 0.5] <- 1
+analysis_norm_v2 <- analysis[!is.na(analysis$patho),]
+
+# Save data with FDR 
+
+write.csv(analysis, 'cm_analysis_indeterminants_v1.csv') # all variant information
+write.csv(analysis_norm_v2, 'cm_analysis_norm_v4.csv') # no indeterminant varaint information 
+
+```
+
+## Figures using splicing data
+
+```{r}
+
+# Visualize counts from assembly and assay for Figure 2C and 2D
+
+counts <- read.csv("parse_barcode_counts_analysis.csv", header = TRUE) # counts come from Unix processing 
+barplot(counts$Barcodes)
+barplot(counts$Constructs)
+
+
+# WT PSI in HEK and iPSC-CM- Figure 2E
+
+wt_PSI <- read.csv('WT_exon_PSI_v4.csv', header = TRUE) #subset HEK/iPSC-CM data in excel
+ggplot(wt_PSI, aes(x=as.factor(Plasmid), y=Mean, fill=Cell)) + 
+    geom_bar(position="dodge", stat="identity") +
+    geom_errorbar(aes(ymin=Mean-SE, ymax=Mean+SE), width=.2,position=position_dodge(.9))+
+    ylim(0,1)
+
+
+# Make waterfall plot of all variants in iPSC-CMs - Figure 3D
+
+analysis <- analysis[order(analysis$delta_psi_norm, decreasing = TRUE), ]
+palette <- RColorBrewer::brewer.pal(length(unique(analysis$patho)),name = 'Set1')
+analysis$color <- palette[as.factor(analysis$patho)] 
+barplot <- barplot(-(analysis$delta_psi_norm), names.arg = analysis$ID, las=2, ylim=c(-1,1),
+                  col=analysis$color,col.main='Blue')
+abline(h=0.50, col='red')
+abline(h=0.20, col = 'blue')
+
+
+# Cell type correlations for Figure 3E
+
+hek2 <- read.csv("PSI_HEK_summary_v2.csv", header = TRUE)
+cm2 <- read.csv("cm_analysis_indeterminants_v1.csv", header = TRUE)
+hek3 <- hek2[, c("ID", "delta_psi_hek", "delta_psi_norm_hek")]
+cm3 <- cm2[, c("ID", "delta_psi", "delta_psi_norm")]
+combo <- merge(hek3, cm3, by="ID")
+model=lm(combo$delta_psi_norm~combo$delta_psi_norm_hek)  
+summary(model)$coefficients[,4]
+combo2 <- combo
+combo2$delta_psi_norm_hek <- -1*combo2$delta_psi_norm_hek
+combo2$delta_psi_norm <- -1*combo2$delta_psi_norm
+
+# Plot delta_psi correlation
+ggscatter(combo2, x = "delta_psi_norm_hek", y = "delta_psi_norm", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "HEK delta_PSI (norm)", ylab = "CM delta_PSI (norm)",
+          ylim = c(-1,1))
+
+
+# Volcano plot of iPSC-CM data - Figure 3F
+
+plot(-(analysis$delta_psi_norm), -log10(analysis$FDR), xlim = c(-1, 1), cex=0.5)
+abline(h=-log10(0.1),col='black')
+abline(v=-0.20,col='blue')
+abline(v=-0.50, col='red')
+
+
+# Plot variant category outcomes in iPSC-CMs - Figure 3G
+
+outcomes_cm <- read.csv('parse_cm_splice_results.csv', header = TRUE)
+ggplot(outcomes_cm, aes(fill=Outcome, y=Number, x=Type)) + 
+    geom_bar(position="stack", stat="identity")
+
+
+```
+
+
+# Part 2 - SpliceAI and experimental splicing analysis 
+
+```{r}
+
+# Plot SpliceAI scores of all in full library - Figure 4A
+
+spliceai_library <- read.csv('spliceai_library_scores.csv', header = TRUE) # table of scores described in methods
+p <- ggplot(spliceai_library, aes(factor(ClinVar.Clinical.Significance), Aggregate.SpliceAI))
+p + geom_violin() + geom_jitter(height = 0, width = 0.1)
+
+
+# Plot SpliceAI vs delta norm values - Figure 4B
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header = TRUE)
+model=lm(analysis$delta_psi_norm~analysis$Aggregate.SpliceAI)  
+summary(model)$coefficients[,4] #2.30e-46
+# Use LOESS now
+plot(analysis$Aggregate.SpliceAI, -1*(analysis$delta_psi_norm), xlim=c(0,1), ylim=c(-1,1))
+analysis$delta_psi_norm <- analysis$delta_psi_norm*-1
+ggscatter(analysis, x = "Aggregate.SpliceAI", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Aggregate SpliceAI", ylab = "Normalized delta PSI") + xlim(0, 1) + ylim(-1,1)
+
+# Plot SpliceAI vs delta norm values - only noncanonical values - Supplemental Figure
+analysis_non_canonical <- analysis[analysis$Intronic.Exonic == "exonic" & analysis$Min.Distance != c(0,1), ]
+model=lm(analysis_non_canonical$delta_psi_norm~analysis_non_canonical$Aggregate.SpliceAI)  
+summary(model)$coefficients[,4] #4.6e-18
+plot(analysis_non_canonical$Aggregate.SpliceAI, analysis_non_canonical$delta_psi_norm, xlim=c(0,1), ylim=c(-1,1))
+ggscatter(analysis_non_canonical, x = "Aggregate.SpliceAI", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE,  
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Aggregate SpliceAI", ylab = "Normalized delta PSI") + xlim(0, 1) + ylim(-1,1)
+
+
+# ROC curves - Figure 4C and supplemental
+
+# All variants 
+analysis <- analysis[!is.na(analysis$patho),]
+analysis <- analysis[!is.na(analysis$Aggregate.SpliceAI),]
+plot(x = analysis$Aggregate.SpliceAI, y = analysis$patho)
+glm.fit=glm(analysis$patho ~ analysis$Aggregate.SpliceAI, family=binomial)
+lines(analysis$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.956
+spliceai_data <- as.data.frame
+
+# Non-canonical intronic 
+analysis_intronic <- analysis[analysis$Intronic.Exonic == "intronic" & analysis$Min.Distance >2, ]
+plot(x = analysis_intronic$Aggregate.SpliceAI, y = analysis_intronic$patho)
+glm.fit=glm(analysis_intronic$patho ~ analysis_intronic$Aggregate.SpliceAI, family=binomial)
+lines(analysis_intronic$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis_intronic$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.989
+
+# Exonic
+analysis_exonic <- analysis[analysis$Intronic.Exonic == "exonic", ]
+plot(x = analysis_exonic$Aggregate.SpliceAI, y = analysis_exonic$patho)
+glm.fit=glm(analysis_exonic$patho ~ analysis_exonic$Aggregate.SpliceAI, family=binomial)
+lines(analysis_exonic$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis_exonic$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.947
+
+
+# Plot quintiles of SpliceAI with assay outcomes - Figure 4D
+spliceai_quantile <- read.csv('parse_spliceai_cm_quantile_count.csv', header=TRUE) # manually curated in Excel
+ggplot(spliceai_quantile, aes(fill=Type, y=Count, x=Quantile)) + 
+    geom_bar(position="stack", stat="identity")
+
+
+# Plot prospective SpliceAI results as pi-chart or stacked barplot - Figure 4E
+
+spliceai_prospective <- read.csv('spliceai_prospective_results.csv', header = TRUE)
+ggplot(spliceai_prospective, aes(fill=Outcome, y=Number, x=Type)) + 
+    geom_bar(position="stack", stat="identity")
+
+
+```
+
+
+
+## Part 3 - ACMG Analysis, Calibration, and Intepretations
+
+### Here we use the assay results to calibrate the strength of functional evidence from our assay using ClinVar annotated variants. 
+
+```{r}
+
+# Perform ACMG Analysis - Figures 5A and 5B
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header=TRUE)
+
+P_LP <- analysis[analysis$ClinVar.Clinical.Significance == "P" | analysis$ClinVar.Clinical.Significance == "P/LP" | analysis$ClinVar.Clinical.Significance == "LP", ]
+B_LB <- analysis[analysis$ClinVar.Clinical.Significance == "B" | analysis$ClinVar.Clinical.Significance == "B/LB" | analysis$ClinVar.Clinical.Significance == "LB", ]
+VUS <- analysis[analysis$ClinVar.Clinical.Significance == "VUS", ]
+CI <- analysis[analysis$ClinVar.Clinical.Significance == "CI", ]
+
+# Use these counts in supplemental file I to obtain OddsPath
+
+
+# Plot standard deviations of benign variants for supplemental figure
+
+mean_benign <- mean(B_LB$delta_psi_norm)
+x <- as.vector(B_LB$delta_psi_norm)
+sd_benign <- sd(x)
+low_cutoff <- mean_benign - (2*sd_benign)
+upper_cutoff <- mean_benign + (2*sd_benign)
+
+
+# Violin plot of B/LB standard deviations
+
+g <- ggplot(B_LB, aes(ClinVar.Clinical.Significance, delta_psi_norm))
+g + geom_violin() + geom_jitter(width=0.10, alpha=0.5) +
+    geom_hline(yintercept = upper_cutoff, linetype = "dashed") +
+    geom_hline(yintercept = low_cutoff, linetype = "dashed") +
+    labs(title="2 SD of B/LB variant delta PSI norm.", 
+         x="B/LB Control Variants",
+         y="Normalized Change in PSI")
+
+# Violin plot of all categories 
+
+g <- ggplot(analysis, aes(ClinVar.Clinical.Significance, delta_psi_norm))
+g + geom_violin() + geom_jitter(width=0.10, alpha=0.5) +
+    geom_hline(yintercept = upper_cutoff, linetype = "dashed") +
+    geom_hline(yintercept = low_cutoff, linetype = "dashed") +
+    labs(title="Distribution of B/LB variants", 
+         x="Control Variants",
+         y="Normalized Change in PSI")
+
+
+# Apply ACMG criteria - leaves blanks as NA and set to 0 at the end, data used in figures 5C and 5D
+
+acmg_input <- read.csv('parse_acmg_interpretation_input.csv', header = TRUE)
+acmg_input_v2 <- merge(acmg_input, analysis, by="ID")
+acmg_input <- acmg_input_v2
+acmg_input$PS3 <- NA
+acmg_input[acmg_input$patho == 1, "PS3"] <- 1
+
+acmg_input$BS3 <- NA
+acmg_input[acmg_input$patho == 0 & acmg_input$MutType == "synonymous", "BS3"] <- 1
+acmg_input[acmg_input$patho == 0 & acmg_input$MutType == "intronic", "BS3"] <- 1
+
+acmg_input$PM2 <- NA
+acmg_input[acmg_input$Allele.Frequency < 0.000025, "PM2"] <- 1
+
+acmg_input$PP3 <- NA
+acmg_input[!is.na(acmg_input$Aggregate.SpliceAI) & acmg_input$Aggregate.SpliceAI >= 0.5, "PP3"] <- 1
+
+acmg_input$BP4 <- NA
+acmg_input[!is.na(acmg_input$Aggregate.SpliceAI) & acmg_input$Aggregate.SpliceAI <= 0.2, "BP4"] <- 1
+
+acmg_output <- acmg_input
+acmg_output[is.na(acmg_output)] <- 0
+
+write.csv(acmg_output, 'parse_acmg_interpretation_output2.csv')
+
+
+```
+
+
+## Automated Patchclamp Analysis for IV curves - Figure 6
+
+### Here we analyze ParSE-seq and APC data (see previous publication for details - PMID: 32533946)
+
+```{r}
+
+# Reload file
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header=TRUE)
+
+# Analyze missense variants in iPSC-CM dataset 
+
+analysis2 <- analysis[analysis$MutType == "missense", ]
+analysis3 <- analysis2[!is.na(analysis2$patho), ]
+analysis3 <- analysis3[analysis3$patho == 1, ]
+unique(analysis3$Protein.Change)
+
+
+# Generate plot of raw PSI of select variants - Figure 6C
+
+SP_analysis <- analysis[analysis$ID == "V246" | analysis$ID == "V193" | analysis$ID == "V305" | analysis$ID == "V309", ]
+write.csv(SP_analysis, 'SP_analysis_data.csv')
+
+
+# Plot raw splicing PSI
+
+SP_analysis2 <- read.csv('SP_analysis_data_formatted_v2.csv') # data processed as described in PMID:32533946 and methods
+SP_analysis2$Construct <- factor(SP_analysis2$Construct, levels = c("Exon 19", "T1131I", "Exon 23", "A1407G"))
+ggplot(SP_analysis2) +
+    geom_bar(aes(x=Construct, y=Mean), stat="identity", fill="skyblue", alpha=0.7) +
+    ylim(0, 1) +
+    geom_errorbar( aes(x=Construct, ymin=Mean-SE, ymax=Mean+SE), width=0.3, colour="orange", alpha=0.9, size=0.5)
+    
+
+
+# Plot SP data as barplot - Figure 6D
+
+SP_analysis3 <- read.csv('SP_analysis_current_v1.csv', header = TRUE)
+SP_analysis3$Construct <- factor(SP_analysis3$Construct, levels = c("T1131I", "A1407G"))
+ggplot(SP_analysis3) +
+    geom_bar(aes(x=Construct, y=MeanCurrent), stat="identity", fill="skyblue", alpha=0.7) +
+    ylim(0, 125) +
+    geom_errorbar( aes(x=Construct, ymin=MeanCurrent-SE, ymax=MeanCurrent+SE), width=0.3, colour="orange", alpha=0.9, size=0.5)
+
+
+
+# Compare in silico predictions for missense variants - Figure 6E
+
+insilico <- read.csv('insilico_scores.csv') # scores obtained from 'variantbrowser.org' 
+p <- ggplot(insilico, aes(x=Predictor,y=Score)) +
+  geom_dotplot(binaxis='y', stackdir='center')
+p
+
+```
+
+
+
