@@ -1,0 +1,1482 @@
+---
+title: "ParSE Main Analysis"
+author: "Matthew O'Neill"
+date: "7/31/2024"
+output: html_document
+---
+
+# ParSE-seq Main Assay
+
+## Here we present a method to determine the splice-altering consequences of cis-genetic variation. We designed minigene plasmids bearing variants in SCN5A that were then subjected to unique barcoding for each variant. These were transfected into cells, spliced RNA was isolated, reverse transcribed, and sequenced to determine variant impact. Computationally, we calculate barcode counts, assembly reads, and Percent Spliced In (PSI) using bash and python scripting in Unix, and then analyze these data in a series of RMDs presented here. The manuscript describing these data is 'ParSE-seq: A Calibrated Multiplexed Assay to Facilitate the Clinical Interpretation of Putative Splice-altering Variants' (PMID: 37732247). Please see this manuscript for full details for an overview of the pipeline and detailed methods. 
+
+
+# ParSE-seq Data Processing
+
+## Step 1 - Check assembly barcode counts by PacBio and Illumina sequencing
+## Step 2 - Assign assembly barcodes to unique Twist inserts
+## Step 3 - Analyze assay barcode counts from iPSC-CMs
+## Step 4 - Calculate PSI associated with assay barcodes 
+
+# ParSE-seq Analysis
+
+## Step 5 - Analyze ParSE-seq results of variant library
+## Step 6 - Compare experimental data with in silico predictors
+## Step 7 - Calibrate assay to controls and interpet variants based on calibrated strenght of evidence
+## Step 8 - Downstream analyses: automated patch-clamp and RNA-seq
+
+
+```{r setup, include=FALSE}
+# Import libraries 
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(spgs)
+library(ggpubr)
+library(pROC)
+library(GGally)
+library(reshape2)
+
+```
+
+# Step 1
+
+## Analyze Barcodes from PacBio long read Assembly
+
+### We sequenced amplicons with a forward primer positioned before the Twist insert and the reverse primer immediately flanking the barcode region (Figure 2A). This configuration would allow us to count how many barcodes were associated with each insert using Long Read NGS and assess library diversity. Barcodes were parsed from individual FASTQ files in Unix and then counted in R. They were then fed back into Unix to sort FASTQ files based on unique barcodes and then to assign barcodes to the unique Twist inserts ordered.
+
+```{r, include = TRUE}
+# Read barcode file 
+
+bc_pacbio <- fread("Full_Assembly_uniform_BCs_counted_combined.txt", header=F, stringsAsFactors = F)
+names(bc_pacbio) <- c("barcode", "count_PB")
+summary(bc_pacbio$count_PB) # median 1, mean 112
+sum(bc_pacbio$count_PB) # 1867171
+sum(bc_pacbio$count_PB>100) #3184
+sum(bc_pacbio$count_PB>10^1.6) #3323
+sum(bc_pacbio$count_PB>50) #3303
+bc_pacbio <- bc_pacbio[bc_pacbio$count_PB > 50, ]
+
+# Export files for Loretta
+
+# verbose
+PB_list_full_v1_verbose <- bc_pacbio[,c("barcode", "count_PB")]
+write.table(PB_list_full_v1_verbose,'PB_list_full_v1_verbose.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+# barcode only
+PB_list_full_v1_barcodeonly <- bc_pacbio[,c("barcode")]
+write.table(PB_list_full_v1_barcodeonly,'PB_list_full_v1_barcodeonly.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+# barcode list
+PB_list_full_v1_barcodelist <- bc_pacbio[,c("barcode", "count_PB")]
+write.table(PB_list_full_v1_barcodelist, 'PB_list_full_v1_barcodelist.txt', quote=FALSE, row.names=FALSE)
+
+
+```
+
+
+## Analyze Assembly barcodes by Illumina short read sequencing
+
+### To ensure compatability among sequencing technologies and for our own reassurement, we also analyzed pre-assay barcode counts by Illumina short read sequencing. The forward primer is in the pAG424 intronic segment with the reverse primer immediately flanking the barcode site - no insert sequence in the amplicon. 
+
+```{r, include = TRUE}
+
+# Read barcode file 
+bc_illumina <- fread("Right_barcode_counts_9402.txt", header=F, stringsAsFactors = F)
+
+summary(bc_illumina$V1) # median 1, mean 44
+sum(bc_illumina$V1) # 26833562
+
+# Check counts
+sum(bc_illumina$V1>1000) #8885
+sum(bc_illumina$V1>10^1.6) #14707
+sum(bc_illumina$V1>40) #14656
+
+names(bc_illumina) <- c("count_illumina", "barcode")
+bc_illumina <- bc_illumina[bc_illumina$count_illumina > 50, ]
+#bc_illumina = bc_illumina.drop_duplicates(subset='barcode', keep='last')
+bc_illumina <- bc_illumina[!duplicated(bc_illumina[,c('barcode')]),]
+hist(bc_illumina$count_illumina, breaks = 20)
+
+```
+
+
+## Compare BC distribution by Illumina and PacBio - overlap and intersections
+
+```{r, inclue = TRUE}
+
+# Compare the barcode abundance for the Assembly using 2 different sequencing technologies
+# This generates the data for Supplemental Figure 5
+
+bc_combined <- merge(bc_illumina, bc_pacbio, by = "barcode")
+bc_combined$logillumina <- (log10(bc_combined$count_illumina) + 1)
+bc_combined$logPB <- (log10(bc_combined$count_PB) + 1)
+p <- ggscatter(bc_combined, x = "logillumina", y = "logPB", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Log Illumina Count", ylab = "Log PacBio Count")
+ggpar(p, xlim = c(2,6), ylim = c(2,6))
+model=lm(bc_combined$logillumina~bc_combined$logPB)  
+summary(model)$coefficients[,4] 
+      
+```
+
+
+# Step 2 
+
+## Assembly - assign barcode to each Twist clonal gene insert after normalization
+
+### Here we assign each barcode to a unique Twist insert. We were cautious to control for PCR-mediated recombination, wherein the barcode may be incorrectly assigned to a different variant during elongation of highly homologous insert sequences bearing unique variants. We demonstrate this was not a concern after optimizing experimental conditions to reduce cycle number, and show high specificity for the assigned insert. 
+
+```{r, include = TRUE}
+
+# Import processed assembly file
+
+assembly_full <- fread("Assembly_full.txt", header=F, stringsAsFactors = F)
+
+# Trim values for processing and normalize read counts
+
+assembly_full$V316 <- substr(assembly_full$V316, 8, 25)
+assembly_full$V1 <- as.integer(substr(assembly_full$V1, 2, nchar(assembly_full$V1)))
+assembly_norm <- assembly_full
+for(i in 1:314){
+  #print(i)
+  assembly_norm[[i]] <- assembly_norm[[i]]/assembly_norm[[315]]
+}
+
+```
+
+```{r, include = FALSE}
+assembly_norm$ID <- "test"
+as.character(assembly_norm$ID)
+
+```
+
+
+### Assign barcodes to unique Twist inserts
+
+```{r}
+
+for(i in 1:3303){
+  value <- (max(assembly_norm[i,1:314]))
+  if(value > 0.5){
+    assembly_norm[i,"ID"] <- colnames(assembly_norm)[apply(assembly_norm[i,1:314],1,which.max)]
+  }
+    else{
+      assembly_norm[i, "ID"] <- NA
+    }
+  }
+
+# Remove low quality barcodes
+
+colnames(assembly_norm)[316] <- "Barcode"
+assembly_norm <- assembly_norm[complete.cases(ID), ] 
+
+# Analyze distribution of assignments - minimal PCR mediated recombination
+
+for (i in 500:502){
+  tmp <- as.vector(assembly_norm[i,])
+  #print(tmp)
+  tmp <- tmp[,1:314]
+  tmp <- as.numeric(tmp)
+  barplot(tmp, axisnames = TRUE, xlab = "Construct", main = i)
+}
+
+# Save data
+
+save(assembly_norm, file = "assembly_norm.RData")
+
+```
+
+
+# Step 3A
+
+## Splicing in iPSC-CM - Experiments 9419-4 to 9419-6
+
+### Here we take processed data from Unix in which barcodes among 3 biological replicates were counted. We look for overlapping barcodes among each replicate, and then export a list of barcodes that are used to parse FASTQ files for PSI calculations in the subsequent step. 
+
+```{r, include = TRUE}
+
+# Analyze barcode counts after processing raw FASTQs in Unix (pipeline in Supplemental Figure III)
+
+bc1 <- fread("Right_combined_barcode_counts_9419-4_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc1) <- c("barcode", "count1")
+summary(bc1$count1) # median 1, mean 121
+sum(bc1$count1) # 16700122
+
+sum(bc1$count1>100) #2925
+sum(bc1$count1>10^1.6) #4519
+sum(bc1$count1>10) #10203
+sum(bc1$count1>5) #16045
+sum(bc1$count1>3) #22097
+bc1 <- bc1[bc1$count1 > 25, ]
+
+# Second replicate 
+
+bc2 <- fread("Right_combined_barcode_counts_9419-5_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc2) <- c("barcode", "count2")
+summary(bc2$count2) # median 1, mean 126.8
+sum(bc2$count2) # 19098237
+
+sum(bc2$count2>100) #2972
+sum(bc2$count2>10^1.6) #4954
+sum(bc2$count2>10) #11649
+sum(bc2$count2>5) #17825
+sum(bc2$count2>3) #26264
+bc2 <- bc2[bc2$count2 > 25, ]
+
+# Third replicate 
+
+bc3 <- fread("Right_combined_barcode_counts_9419-6_v2.txt", header=F, stringsAsFactors = F)
+
+names(bc3) <- c("barcode", "count3")
+summary(bc3$count3) # median 1, mean 141
+sum(bc3$count3) # 18588321
+
+sum(bc3$count3>100) #2529
+sum(bc3$count3>10^1.6) #4238
+sum(bc3$count3>10) #10163
+sum(bc3$count3>5) #15478
+sum(bc3$count3>3) #21025
+bc3 <- bc3[bc3$count3 > 25, ]
+
+
+# Merge dataframes - now just do 1 and 3
+
+bc_all <- merge(bc1, bc3, all = TRUE)
+bc_all <- merge(bc_all, bc2, all = TRUE)
+bc_all <- bc_all[complete.cases(bc_all), ] 
+bc_all$count_sum <- bc_all$count1 + bc_all$count2 + bc_all$count3
+bc_all <- bc_all[bc_all$count_sum > 50, ] #2105 vs 2920... fuck - actually not that bad
+
+bc_merged_CM_v2 <- merge(bc_all, bc_pacbio) #1076 vs 1383 - not that bad of a drop
+
+
+plot(log10(bc_all$count1),log10(bc_all$count2),main='1 vs 2',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+plot(log10(bc_all$count1),log10(bc_all$count3),main='1 vs 3',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+plot(log10(bc_all$count2),log10(bc_all$count3),main='2 vs 3',xlab='Log10(1)',ylab='Log10(2)',pch='.',xlim=c(0,5),ylim=c(0,5))
+abline(h=log10(25),col='red')
+abline(v=log10(25),col='red')
+
+
+# Re-write barcode files for parsing files and calculating PSI
+
+#verbose
+bc_list_full_CM_verbose_v2 <- bc_all[,c("barcode", "count_sum", "count1", "count2", "count3")]
+write.table(bc_list_full_CM_verbose_v2,'bc_list_full_CM_verbose_v2.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#barcode only
+bc_list_full_CM_barcodeonly_v2 <- bc_all[,c("barcode")]
+write.table(bc_list_full_CM_barcodeonly_v2,'bc_list_full_CM_barcodeonly_v2.txt',quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#barcode list
+bc_list_full_CM_barcodelist_v2 <- bc_all[,c("barcode", "count_sum")]
+write.table(bc_list_full_CM_barcodelist_v2, 'bc_list_full_CM_barcodelist_v2.txt', quote=FALSE, row.names=FALSE)
+
+# Create unique file from processed data
+
+reads <- fread("9419_4-6_unique_barcode_list_v2.txt", header=F, stringsAsFactors = F)
+reads <- as.data.frame(reads$V1)
+write.table(reads, '9419_4-6_unique_barcode_Only_v2.txt', quote=FALSE, row.names=FALSE)
+
+
+```
+
+
+# Step 4
+
+## iPSC-CM PSI calculations
+
+### The following provides the main output of our assay. We calculate PSI from splice junctions associated with each construct that were quantified per barcode in Unix. We assign each barcode to the unique Twist insert using the Assembly data. We use those IDs to call the relevant splice junctions, accounting for coding variants that need to be explicitly accounted for in this analysis. We repeat this for all 3 replicates and collapse barcodes by variant. We then determine the difference in PSI vs respective WT insert, and perform statistical tests to call a normal vs abnormal result.  
+
+
+```{r, include = TRUE}
+
+# Compare PSI's across replicates - updated with fixed replicates 2/16/2023
+
+PSI_4 <- fread("9419-4_PSI_v5.txt", header=F, stringsAsFactors = F)
+PSI_5 <- fread("9419-5_PSI_v5.txt", header=F, stringsAsFactors = F)
+PSI_6 <- fread("9419-6_PSI_v5.txt", header=F, stringsAsFactors = F)
+
+
+# Replicate 4
+
+colnames(PSI_4) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_4$Barcode <- substr(PSI_4$Barcode, 8, 25)
+PSI_4$`5_for` <- as.integer(substr(PSI_4$`5_for`, 2, nchar(PSI_4$`5_for`)))
+
+PSI_4 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_4 <- as.data.frame(PSI_4 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_4$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_4[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_4[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_4 <- PSI_4[complete.cases(PSI_4$ID), ] #927
+
+# Create PSI column
+
+PSI_4$PSI <- NA
+
+# Load indices
+
+pairs_full_4 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_4$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_4[i, 1]
+  tmp2 <- pairs_full_4[i, 2]
+  tmp3 <- pairs_full_4[i, 3]
+  tmp4 <- pairs_full_4[i, 4]
+  test_data <- PSI_4[PSI_4$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_4[n, "ID"] == tmp2){
+      PSI_4[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+# Replicate 5
+
+colnames(PSI_5) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_5$Barcode <- substr(PSI_5$Barcode, 8, 25)
+PSI_5$`5_for` <- as.integer(substr(PSI_5$`5_for`, 2, nchar(PSI_5$`5_for`)))
+
+PSI_5 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_5 <- as.data.frame(PSI_5 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_5$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_5[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_5[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_5 <- PSI_5[complete.cases(PSI_5$ID), ] 
+
+# Create PSI column
+
+PSI_5$PSI <- NA
+
+# Load indices
+
+pairs_full_5 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_5$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_5[i, 1]
+  tmp2 <- pairs_full_5[i, 2]
+  #print(tmp2)
+  tmp3 <- pairs_full_5[i, 3]
+  tmp4 <- pairs_full_5[i, 4]
+  test_data <- PSI_5[PSI_5$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_5[n, "ID"] == tmp2){
+      PSI_5[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+# Replicate 6
+
+colnames(PSI_6) <- c("5_for", "6_for", "7_for", "8_for", "9_for", "10_for", "11_for", 
+                       "12_for", "13_for", "14_for", "15_for", "16_for", "17_for", "18_for", 
+                       "19_for", "20_for", "21_for", "22_for", "23_for", "24_for", "27_for", 
+                       "skip_for", "5_rev", "6_rev", "7_rev", "8_rev", "9_rev",  "10_rev", "11_rev",
+                       "12_rev", "13_rev", "14_rev", "15_rev", "16_rev", "17_rev", "18_rev", 
+                       "19_rev", "20_rev", "21_rev", "22_rev",  "23_rev", "24_rev","27_rev", 
+                       "skip_rev", "3-38620843-G-A_R1", "3-38620843-G-T_R1", "3-38620971-C-T_R2",
+                       "3-38606669-C-A_R1", "3-38606669-C-G_R1", "3-38605951-C-T_R1",
+                       "3-38605951-C-A_R1", "3-38605951-C-G_R1", "3-38604729-C-A_R1",
+                       "3-38604729-C-G_R1", "3-38604729-C-T_R1", "3-38603712-C-T_R1",
+                       "3-38603712-C-A_R1", "3-38603712-C-G_R1", "3-38598918-C-A_R1",
+                       "3-38598918-C-G_R1", "3-38598918-C-T_R1", "3-38597729-C-A_R1",
+                       "3-38597729-C-G_R1", "3-38597729-C-T_R1", "3-38579334-C-A_R1",
+                       "3-38579334-C-G_R1", "3-38579334-C-T_R1", "3-38575451-C-T_R2",
+                       "3-38566409-G-A_R1", "3-38566582-C-G_R2", "3-38562415-C-T_R1",
+                       "3-38557231-C-A_R1", "3-38557284-C-T_R2", "3-38557231-C-G_R1",
+                       "3-38557231-C-T_R1", "3-38554279-C-T_R1", "3-38620844-C-T_R1",
+                       "3-38613744-T-G_R1", "3-38605952-T-A_R1", "3-38604907-G-C_R2",
+                       "3-38604730-A-T_R1", "3-38603713-G-A_R1", "3-38597730-A-T_R1",
+                       "3-38586040-A-T_R2", "3-38579494-T-A_R2", "3-38579494-T-C_R2",
+                       "3-38579494-T-G_R2", "3-38579335-T-C_R1", "3-38576780-G-A_R2",
+                       "3-38576780-G-C_R2", "3-38560427-ACCT-A_R2", "3-38557232-C-A_R1",
+                       "3-38557232-CCCCTGGAGTCCACAGCTGCATACATAATGT-C_R1", "3-38604906-G-A_R2",
+                       "3-38598920-T-A_R1", "3-38579493-C-A_R2", "3-38579493-C-G_R2",
+                       "3-38579493-C-T_R2", "3-38576779-G-A_R2", "3-38575299-G-A_R1",
+                       "3-38560426-C-T_R2", "3-38557233-C-A_R1", "3-38620968-G-A_R2",
+                       "3-38608154-G-C_R1", "3-38605954-G-A_R1", "3-38597732-G-A_R1",
+                       "3-38557234-C-T_R1", "3-38557234-C-G_R1", "3-38557234-C-A_R1",
+                       "3-38579338-C-T_R1", "3-38597735-T-A_R1", "3-38579340-G-A_R1",
+                       "3-38579340-G-T_R1", "3-38586037-C-T_R2",
+                       "total_reads", "Barcode")
+  
+PSI_6$Barcode <- substr(PSI_6$Barcode, 8, 25)
+PSI_6$`5_for` <- as.integer(substr(PSI_6$`5_for`, 2, nchar(PSI_6$`5_for`)))
+
+PSI_6 %>% group_by(Barcode) %>% summarise_all(funs(sum))
+PSI_6 <- as.data.frame(PSI_6 %>% group_by(Barcode) %>% summarise_all(funs(sum)))
+
+for (n in 1:length(PSI_6$Barcode)){
+  #print(n)
+  for (i in 1:3238){
+    if(PSI_6[n, "Barcode"] == assembly_norm[i, "Barcode"]){
+      PSI_6[n, "ID"] <- assembly_norm[i, "ID"]
+    }
+    }
+}
+
+PSI_6 <- PSI_6[complete.cases(PSI_6$ID), ] 
+
+# Create PSI column
+
+PSI_6$PSI <- NA
+
+# Load indices
+
+pairs_full_6 <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_6$WT_PSI <- 0
+
+# Assign WT_PSI with loop
+
+for (i in 1:310){
+  #print(i)
+  tmp1 <- pairs_full_6[i, 1]
+  tmp2 <- pairs_full_6[i, 2]
+  tmp3 <- pairs_full_6[i, 3]
+  tmp4 <- pairs_full_6[i, 4]
+  test_data <- PSI_6[PSI_6$ID == tmp2, ]
+  test_data$WT_PSI <- ((pmin(test_data[[tmp3]], test_data[[tmp4]]))/(test_data$total_reads/2))
+  tmp_average <- (mean(test_data$WT_PSI))
+  for (n in 1:927){
+    if(PSI_6[n, "ID"] == tmp2){
+      PSI_6[n, "PSI"] <- tmp_average
+    }
+    }
+}
+
+
+# PSI summaries - update on 2/16/2023 - v3
+
+save(assembly_norm, PSI_4, PSI_5, PSI_6, file = "PSI_sum_CM_v3.RData")
+
+
+# Create new dataframe with barcodes and PSI for all 3 replicates - just want ID and PSI
+
+PSI_4_data <- PSI_4[,c("ID", "PSI")]
+PSI_4_data <- unique(PSI_4_data)
+colnames(PSI_4_data) <- c("ID", "PSI_4")
+PSI_5_data <- PSI_5[,c("ID", "PSI")]
+PSI_5_data <- unique(PSI_5_data)
+colnames(PSI_5_data) <- c("ID", "PSI_5")
+PSI_6_data <- PSI_6[,c("ID", "PSI")]
+PSI_6_data <- unique(PSI_6_data)
+colnames(PSI_6_data) <- c("ID", "PSI_6")
+
+PSI_summary <- merge(PSI_4_data, PSI_5_data)
+PSI_summary <- merge(PSI_summary, PSI_6_data)
+PSI_summary <- na.omit(PSI_summary)
+
+cor(PSI_summary$PSI_4, PSI_summary$PSI_5, method = "pearson")
+
+ggscatter(PSI_summary, x = "PSI_4", y = "PSI_5", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 1 PSI", ylab = "Replicate 2 PSI")
+
+ggscatter(PSI_summary, x = "PSI_4", y = "PSI_6", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 1 PSI", ylab = "Replicate 3 PSI")
+
+ggscatter(PSI_summary, x = "PSI_5", y = "PSI_6", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Replicate 2 PSI", ylab = "Replicate 3 PSI")
+
+
+# Perform summary statistics of the available barcodes - PSI, delta_PSI, norm_delta_PSI, p-value
+
+# Now perform statistical test between variant and WT and Variant and report results
+
+stat_result <- c()
+delta_psi <- c()
+delta_psi_norm <- c()
+
+# Subset pairs by the reads that we have in the dataset - then no error 
+
+PSI_summary$p_value <- NA
+pairs_full <- read.csv("parse_variant_pairs_v3.csv", header=TRUE)
+pairs_full_filtered <- subset(pairs_full, variants %in% PSI_summary$ID)
+PSI_summary$delta_psi <- 0
+PSI_summary$delta_psi_norm <- 0
+for (i in 1:238){
+  tmp1 <- pairs_full_filtered[i, 1]
+  tmp2 <- pairs_full_filtered[i, 2]
+  test_data <- PSI_summary[PSI_summary$ID == tmp1| PSI_summary$ID == tmp2, ]
+  stat_result[i] <- t.test(test_data[test_data$ID == tmp1, 2:4], test_data[test_data$ID == tmp2, 2:4])$p.value
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "p_value"] <- stat_result[i]
+    }
+  }
+  delta_psi[i] <- (mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')) - mean(as.vector(test_data[test_data$ID == tmp2, 2:4], mode='numeric')))
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "delta_psi"] <- delta_psi[i]
+    }
+  }
+  delta_psi_norm[i] <- ((mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')) - mean(as.vector(test_data[test_data$ID == tmp2, 2:4], mode='numeric'))) / mean(as.vector(test_data[test_data$ID == tmp1, 2:4], mode='numeric')))
+  for (n in 1:257){
+    if(PSI_summary[n, "ID"] == tmp2){
+      PSI_summary[n, "delta_psi_norm"] <- delta_psi_norm[i]
+    }
+  }
+}
+
+# Plot delta_psi vs p-value to gain intuition about significant effect size 
+
+plot(abs(PSI_summary$delta_psi), PSI_summary$p_value)
+abline(h=0.05,col='red')
+abline(v=0.20,col='red')
+
+# Make as a volcano plot - Figure 3F
+
+plot(PSI_summary$delta_psi, -log10(PSI_summary$p_value), xlim = c(-1, 1))
+abline(h=-log10(0.05),col='red')
+abline(v=0.20,col='red')
+abline(v=-0.20, col='red')
+
+# Update files
+
+write.csv(PSI_summary, 'PSI_CM_summary_v2.csv')
+save(PSI_summary, file = "checkpoint_CM_v3.Rdata")
+
+
+# Add standard error to replicates
+
+PSI_summary$standard_error <- NA
+for(n in 1:length(PSI_summary$ID)){
+  x <- as.vector(PSI_summary[n, 2:4])
+  standard_error <- sd(x)/sqrt(3)
+  print(standard_error)
+  PSI_summary[n, 8] <- standard_error
+}
+
+hist(PSI_summary$standard_error, breaks = 100, xlim=c(0,0.30))
+
+# ggpairs visualization of replicate correlation for Supplemental Figure VII
+
+PSI_summary <- PSI_summary[PSI_summary$standard_error < 0.15, ]
+
+ggpairs(PSI_summary, 
+        columns = c("PSI_4", "PSI_5", "PSI_6"), c("Replicate 1","Replicate 2","Replicate 3"))
+
+write.csv(PSI_summary, 'PSI_CM_summary_v3.csv')
+save(PSI_summary, file = "checkpoint_CM_v4.Rdata")
+
+
+# Visualize counts from assembly and assay for Figure 2C and 2D
+
+counts <- read.csv("parse_barcode_counts_analysis.csv", header = TRUE)
+barplot(counts$Barcodes)
+barplot(counts$Constructs)
+
+
+# Analyze HEK and CM data for Figure 3E
+
+hek2 <- read.csv("PSI_HEK_summary_v2.csv", header = TRUE)
+cm2 <- read.csv("cm_analysis_indeterminants_v1.csv", header = TRUE)
+
+hek3 <- hek2[, c("ID", "delta_psi_hek", "delta_psi_norm_hek")]
+cm3 <- cm2[, c("ID", "delta_psi", "delta_psi_norm")]
+
+combo <- merge(hek3, cm3, by="ID")
+
+# Math for correlation
+
+model=lm(combo$delta_psi_norm~combo$delta_psi_norm_hek)  
+summary(model)$coefficients[,4]
+
+combo2 <- combo
+combo2$delta_psi_norm_hek <- -1*combo2$delta_psi_norm_hek
+combo2$delta_psi_norm <- -1*combo2$delta_psi_norm
+
+# Plot delta_psi correlation
+ggscatter(combo2, x = "delta_psi_norm_hek", y = "delta_psi_norm", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "HEK delta_PSI (norm)", ylab = "CM delta_PSI (norm)",
+          ylim = c(-1,1))
+
+
+```
+
+
+# Step 5
+
+## Analyze results using data with curated Twist library - Figure 3 Data
+
+```{r}
+
+# Merge variant info with PSI plots, perform analysis of data, and export 
+
+twist_library <- read.csv("parse_twist_summary_v4.csv")
+analysis <- merge(PSI_summary, twist_library, by="ID")
+
+
+# Assign normal/abnormal based off of biological and statistical signifiance 
+
+analysis$FDR <- p.adjust(analysis$p_value, method = "fdr", n = length(analysis$p_value))
+analysis$patho <- NA
+analysis$patho[analysis$FDR >= 0.1 & analysis$delta_psi_norm < 0.2] <- 0
+analysis$patho[analysis$FDR < 0.1 & analysis$delta_psi_norm > 0.5] <- 1
+analysis <- analysis[!is.na(analysis$patho),]
+analysis_norm_v2 <- analysis
+
+# Save data with FDR 
+
+write.csv(analysis, 'cm_analysis_indeterminants_v1.csv')
+write.csv(analysis_norm_v2, 'cm_analysis_norm_v4.csv')
+
+# Sensitivity analysis - Supplemental Table 4
+
+# List controls used for calibration
+benign_controls <- as.vector(c('c.795C>T', 'c.1017C>T', 'c.858G>A', 'c.885G>A', 'c.1110G>A', 'c.1236C>T', 'c.1302C>T', 'c.1335C>T', 'c.1479G>A', 'c.1587T>C', 'c.3540G>A', 'c.3621C>T', 'c.4788C>T', 'c.1141-3C>A', 'c.1890+7C>T', 'c.3840+8T>C', 'c.703+45C>A', 'c.1338+20G>A', 'c.1339-24G>A', 'c.3511+72T>C', 'c.3840+17G>A', 'c.4299+28C>T', 'c.3391-16A>T', 'c.3511+10C>T', 'c.3666+10T>C', 'c.935-46C>G', 'c.1890+50C>T', 'c.2262+33del', 'c.2787+53C>A', 'c.3229-30G>A'))
+pathogenic_controls <- as.vector(c('c.611+3_611+4dup', 'c.3963+2T>C', 'c.4299G>T', 'c.4813+3_6dupGGGT', 'c.3964-2_3964del', 'c.612-1G>A', 'c.703+1G>C', 'c.703+1G>T', 'c.704-2A>G', 'c.1140+2T>G', 'c.999-1G>A', 'c.1141-2A>G', 'c.1519-1G>A', 'c.2023+1G>A', 'c.2024-1G>A', 'c.2787+1G>T', 'c.3391-1G>A', 'c.3512-1G>A', 'c.3512-1G>C', 'c.3963+1G>A', 'c.4246-2A>G', 'c.4299+1dup', 'c.4299+1G>T', 'c.934+1G>A', 'c.1891-1G>A', 'c.2023+2T>A', 'c.2787+2T>A', 'c.483-1G>A', 'c.1338+2T>A', 'c.3840+1G>A', 'c.4245+1G>C', 'c.4246-2del', 'c.1141-1G>A', 'c.611+1G>A', 'c.3666+2T>C', 'c.3957_3963+1dup', 'c.4299+1del', 'c.4242+2T>A'))
+
+
+analysis$control <- NA
+analysis_benign <- analysis[analysis$cDNA.Change %in% benign_controls, ]
+analysis_benign$control <- "Benign"
+column_sums_benign <- sum(analysis_benign$patho)
+analysis_pathogenic <- analysis[analysis$cDNA.Change %in% pathogenic_controls, ]
+analysis_pathogenic$control <- "Pathogenic"
+column_sums_pathogenic <- sum(analysis_pathogenic$patho == 0)
+analysis_test <- rbind(analysis_benign, analysis_pathogenic)
+
+
+```
+
+```{r}
+
+# Make figures using data for main text
+
+# WT PSI in HEK and iPSC-CM- Figure 2E
+
+wt_PSI <- read.csv('WT_exon_PSI_v4.csv', header = TRUE) #subset HEK/iPSC-CM data in excel
+ggplot(wt_PSI, aes(x=as.factor(Plasmid), y=Mean, fill=Cell)) + 
+    geom_bar(position="dodge", stat="identity") +
+    geom_errorbar(aes(ymin=Mean-SE, ymax=Mean+SE), width=.2,position=position_dodge(.9))+
+    ylim(0,1)
+
+
+
+# Lollipop diagrams for Figure 3A-C
+
+# Read in data (run 2X--once for HEK and once for ipsc)
+a=read.csv('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/cm_analysis_norm_v3.csv')
+a=read.csv('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/analysis_norm_v2_hek.csv')
+
+##### PLOT 1: ALL EXONS #####
+# Remove WT constructs, add 1 to min distance (so we aren't taking log of 0), and calculate left/right side
+a=a[!a$Category=='WT_construct',]
+a$Min.Distance=a$Min.Distance+1
+a$leftOrRight="left"
+a$leftOrRight[a$Donor.Distance<a$Acceptor.Distance]='right'
+
+# Variables to alter
+valueScaleFactor=10
+invertTF=TRUE
+valueColname="delta_psi_norm"
+exonnumColname="Construct.Exon"
+leftOrRightColname="leftOrRight"
+intronOrExonColname="Intronic.Exonic"
+distanceColname="Min.Distance"
+pdfName='~/Desktop/ParseSeqPlot_allExons_ipscm.pdf'
+pdfName='~/Desktop/ParseSeqPlot_allExons_HEK.pdf'
+
+# Calculate exon start and stop positions
+exonNums=5:27 #23 exons to plot
+exonStarts = seq(5,181,by=8)
+exonStops = seq(8,184,by=8)
+
+# Make plot
+pdf(pdfName)
+plot(c(0,200),c(-20,95),type='n',axes=FALSE,xlab='',ylab='')
+# Canonical
+plotBoxes(85)
+a_canonical=a[a$Min.Distance<=2 & a$Intronic.Exonic=='intronic',]
+text(20,70,label="Canonical",cex=0.75)
+plotRow(a_canonical,60,'red')
+# Intronic
+a_intronic=a[a$Intronic.Exonic=='intronic' & a$Min.Distance>2,]
+text(20,35,label="Intronic",cex=0.75)
+plotRow(a_intronic,25,'brown')
+# Exonic
+a_exonic=a[a$Intronic.Exonic=='exonic',]
+text(20,5,label="Exonic",cex=0.75)
+plotRow(a_exonic,-5,'purple')
+dev.off()
+
+##### PLOT 2: 1 exon at a time vertically #####
+exonSizeTable=read.csv('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/parse_construct_size.csv')
+pdf('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/ParseSeqPlot_byExon_1-10_HEK.pdf')
+pdf('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/ParseSeqPlot_byExon_11-19_HEK.pdf')
+pdf('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/ParseSeqPlot_byExon_1-10_ipsccm.pdf')
+pdf('~/Dropbox/Andrew-Matthew/ParSE-seq/Exon schematic figure/ParseSeqPlot_byExon_11-19_ipsccm.pdf')
+
+plot(c(-1,10),c(0,300),type='n',main='Single exon',xlab='',ylab='',axes=FALSE)
+currHeight=320
+#for(i in 1:nrow(exonSizeTable)){
+for(i in 1:10){
+#for(i in 11:19){
+  exonNum=exonSizeTable[i,'construct']
+  print(exonNum)
+  a2=a[a[,exonnumColname]==exonNum,]
+  if(nrow(a2)>0){
+    currHeight=currHeight-30
+    text(-.4,currHeight,labels=exonNum)
+    plotBoxesSingleExon2(exonNum,exonSizeTable,currHeight)
+    a2_canonical=a2[a2$Intronic.Exonic=='intronic' & a2$Min.Distance<=2,]
+    if(nrow(a2_canonical>0)){
+      plotRow(a2_canonical,currHeight,'red',ignoreExonNum=TRUE,skipGreyLine=TRUE,simplePos=TRUE,exonSizeTable=exonSizeTable)
+    }
+    a2_intronic=a2[a2$Intronic.Exonic=='intronic' & a2$Min.Distance>2,]
+    if(nrow(a2_intronic>0)){
+      plotRow(a2_intronic,currHeight,'blue',ignoreExonNum=TRUE,skipGreyLine=TRUE,simplePos=TRUE,exonSizeTable=exonSizeTable)
+    }
+    a2_exonic=a2[a2$Intronic.Exonic=='exonic',]
+    if(nrow(a2_exonic>0)){
+      plotRow(a2_exonic,currHeight,'purple',ignoreExonNum=TRUE,skipGreyLine=TRUE,simplePos=TRUE,exonSizeTable=exonSizeTable)
+    }
+  }
+}
+dev.off()
+
+
+##### FUNCTIONS #####
+#convertPosition(5,'right','intronic',2,ignoreExonNum=TRUE)
+#convertPositionSimple(5,'right','intronic',2,exonSizeTable)
+convertPositionSimple=function(exon,leftOrRight,intronOrExon,distance,exonSizeTable){
+  exon_size=exonSizeTable[exonSizeTable$construct==exon,'exon_size']
+  intron_size=exonSizeTable[exonSizeTable$construct==exon,'intron_size']
+  construct_size=exonSizeTable[exonSizeTable$construct==exon,'construct_size']
+  print(exon_size)
+  print(intron_size)
+  print(construct_size)
+  exonStartPoint=intron_size/100
+  exonEndPoint=(intron_size+exon_size)/100
+  print(exonEndPoint)
+  leftIntronStartPoint=0
+  rightIntronEndPoint=construct_size/100
+  if(leftOrRight=="left" & intronOrExon=="intronic"){
+    newDistance=exonStartPoint-distance/100
+  }
+  if(leftOrRight=="left" & intronOrExon=="exonic"){
+    newDistance=exonStartPoint+distance/100
+  }
+  if(leftOrRight=="right" & intronOrExon=="exonic"){
+    newDistance=exonEndPoint-distance/100
+  }
+  if(leftOrRight=="right" & intronOrExon=="intronic"){
+    newDistance=exonEndPoint+distance/100
+  }
+  return(newDistance)
+}
+convertPosition=function(exon,leftOrRight,intronOrExon,distance,ignoreExonNum=FALSE){
+  if(distance==2){
+    distance=1.2
+  }
+  exonStartPoint=(exon-5)*8+5
+  exonEndPoint=exonStartPoint+3
+  if(ignoreExonNum){
+    exonStartPoint=2.5
+    exonEndPoint=5.5
+  }
+  leftIntronStartPoint=exonStartPoint-2.5
+  rightIntronEndPoint=exonEndPoint+2.5
+  logDistance=log10(distance)
+  if(logDistance>2){
+    logDistance=2
+  }
+  if(intronOrExon=='intronic'){
+    logDistance=logDistance*2.5/2
+  } else{
+    logDistance=logDistance*1.5/2
+  }
+  if(leftOrRight=="left" & intronOrExon=="intronic"){
+    newDistance=exonStartPoint-logDistance
+  }
+  if(leftOrRight=="left" & intronOrExon=="exonic"){
+    newDistance=exonStartPoint+logDistance
+  }
+  if(leftOrRight=="right" & intronOrExon=="exonic"){
+    newDistance=exonEndPoint-logDistance
+  }
+  if(leftOrRight=="right" & intronOrExon=="intronic"){
+    newDistance=exonEndPoint+logDistance
+  }
+  return(newDistance)
+}
+plotRow=function(a,currHeight,pointColor,ignoreExonNum=FALSE,skipGreyLine=FALSE,simplePos=FALSE,exonSizeTable=NA){
+  if(!skipGreyLine){
+    segments(0,currHeight,189,currHeight,col='gray')
+  }
+  for(i in 1:nrow(a)){
+    exonNum=a[i,exonnumColname]
+    leftOrRight=a[i,leftOrRightColname]
+    intronOrExon=a[i,intronOrExonColname]
+    distance=a[i,distanceColname]
+    print(exonNum)
+    print(leftOrRight)
+    print(intronOrExon)
+    print(distance)
+    if(simplePos){
+      plotPosition=convertPositionSimple(exonNum,leftOrRight,intronOrExon,distance,exonSizeTable)
+      print(plotPosition)
+    } else{
+      plotPosition=convertPosition(exonNum,leftOrRight,intronOrExon,distance,ignoreExonNum)
+    }
+    value=a[i,valueColname]
+    if(invertTF){
+      value=-1*value
+    }
+    points(plotPosition,currHeight+value*valueScaleFactor,col=pointColor)
+    segments(plotPosition,currHeight,plotPosition,currHeight+value*valueScaleFactor,col=pointColor)
+  }
+}
+plotBoxes=function(currHeight){
+  # Plot gene schematic
+  for(i in 1:23){
+    exonNum=exonNums[i]
+    exonStart=exonStarts[i]
+    exonStop=exonStops[i]
+    rect(exonStart,currHeight-5,exonStop,currHeight+5)
+    text(exonStart+1,currHeight+10,labels = exonNum,cex=.5)
+  }
+  segments(0,currHeight,189,currHeight)
+}
+plotBoxesSingleExon=function(currHeight){
+  rect(2.5,currHeight-2.5,5.5,currHeight+2.5)
+  segments(0,currHeight,8,currHeight)
+}
+plotBoxesSingleExon2=function(exonNum,exonSizeTable,currHeight){
+  exon_size=exonSizeTable[exonSizeTable$construct==exonNum,'exon_size']
+  intron_size=exonSizeTable[exonSizeTable$construct==exonNum,'intron_size']
+  construct_size=exonSizeTable[exonSizeTable$construct==exonNum,'construct_size']
+  exonStartPoint=intron_size/100
+  exonEndPoint=(intron_size+exon_size)/100
+  rect(exonStartPoint,currHeight-2.5,exonEndPoint,currHeight+2.5)
+  segments(0,currHeight,intron_size/100,currHeight)
+  segments((intron_size+exon_size)/100,currHeight,construct_size/100,currHeight)
+}
+
+
+# Make waterfall plot of all variants in iPSC-CMs - Figure 3D
+
+analysis <- analysis[order(analysis$delta_psi_norm, decreasing = TRUE), ]
+palette <- RColorBrewer::brewer.pal(length(unique(analysis$patho)),name = 'Set1')
+analysis$color <- palette[as.factor(analysis$patho)] 
+barplot <- barplot(analysis$delta_psi_norm, names.arg = analysis$ID, las=2, ylim=c(-1,1),
+                  col=analysis$color,col.main='Blue')
+abline(h=0.50, col='red')
+abline(h=0.20, col = 'blue')
+
+
+
+
+# Volcano plot of iPSC-CM data - Figure 3E
+
+plot(-(analysis$delta_psi_norm), -log10(analysis$FDR), xlim = c(-1, 1), cex=0.5)
+abline(h=-log10(0.1),col='black')
+abline(v=-0.20,col='blue')
+abline(v=-0.50, col='red')
+
+
+
+# Plot variant category outcomes in iPSC-CMs - Figure 3F
+
+outcomes_cm <- read.csv('parse_cm_splice_results.csv', header = TRUE)
+ggplot(outcomes_cm, aes(fill=Outcome, y=Number, x=Type)) + 
+    geom_bar(position="stack", stat="identity")
+
+
+```
+
+
+# Part 6 - In silico predictors - Retrospective and Prospective - Figure 4 Data
+
+```{r}
+
+# Load in silico predictors
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header = TRUE)
+pangolin <- read.csv('ParSE_pangolin_scores.csv', header = TRUE)
+analysis <- merge(pangolin, analysis, by = 'HGVS.Nomenclature')
+plot(analysis$Aggregate.SpliceAI, analysis$Pangolin_Aggregate)
+#ABSplice <- read.table("ParSE_AbSplice_0.05.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE )
+ABSplice <- read.csv("ABSplice_SCN5A_scores.csv", header = TRUE)
+analysis <- merge(analysis, ABSplice, by = 'HGVS.Nomenclature', all.x = TRUE)
+analysis$delta_psi_norm <- analysis$delta_psi_norm*-1
+analysis_non_canonical <- analysis[analysis$Min.Distance != 1 & analysis$Min.Distance != 2, ]
+
+# Plot SpliceAI scores of all in full library - Figure 4A
+
+spliceai_library <- read.csv('spliceai_library_scores.csv', header = TRUE)
+p <- ggplot(spliceai_library, aes(factor(ClinVar.Clinical.Significance), Aggregate.SpliceAI))
+p + geom_violin() + geom_jitter(height = 0, width = 0.1)
+
+
+# Plot quintiles of SpliceAI with assay outcomes - Figure 4B
+
+spliceai_quantile <- read.csv('parse_spliceai_cm_quantile_count.csv', header=TRUE)
+ggplot(spliceai_quantile, aes(fill=Type, y=Count, x=Quantile)) + 
+    geom_bar(position="stack", stat="identity")
+
+
+# Plot SpliceAI vs delta norm values (all variants) - Supplemental Figure 12A
+
+ggscatter(analysis, x = "Aggregate.SpliceAI", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Aggregate SpliceAI", ylab = "Normalized delta PSI") + xlim(0, 1) + ylim(-1,1)
+cor_test_result <- cor.test(analysis$Aggregate.SpliceAI, analysis$delta_psi_norm, method = "pearson", use = "complete.obs")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+# Plot SpliceAI vs delta norm values (no CSS) - Figure 4D
+
+ggscatter(analysis_non_canonical, x = "Aggregate.SpliceAI", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Aggregate SpliceAI", ylab = "Normalized delta PSI") + xlim(0, 1) + ylim(-1,1)
+cor_test_result <- cor.test(analysis_non_canonical$Aggregate.SpliceAI, analysis_non_canonical$delta_psi_norm, method = "pearson", use = "complete.obs")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+
+
+# Plot Pangolin vs delta norm values (all variants) - Supplemental Figure 12B
+
+ggscatter(analysis, x = "Pangolin_Aggregate", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Pangolin Scores", ylab = "Normalized delta PSI") + xlim(0, 0.80) + ylim(-1,1)
+cor_test_result <- cor.test(analysis$Pangolin_Aggregate, analysis$delta_psi_norm, method = "pearson")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+# Plot Pangolin vs delta norm values (no CSS) - Figure 4E
+
+ggscatter(analysis_non_canonical, x = "Pangolin_Aggregate", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Pangolin Scores", ylab = "Normalized delta PSI") + xlim(0, .80) + ylim(-1,1)
+cor_test_result <- cor.test(analysis_non_canonical$Pangolin_Aggregate, analysis_non_canonical$delta_psi_norm, method = "pearson", use = "complete.obs")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+# Plot AbSplice vs delta norm values (all variants) - Supplemental Figure 12C
+
+analysis$delta_psi_Heart_Left_Ventricle <- analysis$delta_psi_Heart_Left_Ventricle * -1
+ggscatter(analysis, x = "delta_psi_Heart_Left_Ventricle", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "AbSplice", ylab = "Normalized delta PSI") + ylim(-1,1)
+cor_test_result <- cor.test(analysis$delta_psi_Heart_Left_Ventricle, analysis$delta_psi_norm, method = "pearson", use = "complete.obs")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+# Plot AbSplice vs delta norm values (no CSS) - Figure 4F
+
+analysis_non_canonical$delta_psi_Heart_Left_Ventricle <- analysis_non_canonical$delta_psi_Heart_Left_Ventricle * -1
+ggscatter(analysis_non_canonical, x = "delta_psi_Heart_Left_Ventricle", y = "delta_psi_norm", 
+          add = "loess", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "AbSplice", ylab = "Normalized delta PSI") + ylim(-1,1)
+cor_test_result <- cor.test(analysis_non_canonical$delta_psi_Heart_Left_Ventricle, analysis_non_canonical$delta_psi_norm, method = "pearson", use = "complete.obs")
+correlation_coefficient <- cor_test_result$estimate
+p_value <- cor_test_result$p.value
+
+
+# SpliceAI ROC CURVES - Figure 4C
+
+# All variants
+
+analysis <- analysis[!is.na(analysis$patho),]
+analysis <- analysis[!is.na(analysis$Aggregate.SpliceAI),]
+plot(x = analysis$Aggregate.SpliceAI, y = analysis$patho)
+glm.fit=glm(analysis$patho ~ analysis$Aggregate.SpliceAI, family=binomial)
+lines(analysis$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.956
+spliceai_data <- as.data.frame
+
+# Non-canonical intronic 
+
+analysis_intronic <- analysis[analysis$Intronic.Exonic == "intronic" & analysis$Min.Distance >2, ]
+plot(x = analysis_intronic$Aggregate.SpliceAI, y = analysis_intronic$patho)
+glm.fit=glm(analysis_intronic$patho ~ analysis_intronic$Aggregate.SpliceAI, family=binomial)
+lines(analysis_intronic$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis_intronic$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.989
+
+# Exonic
+
+analysis_exonic <- analysis[analysis$Intronic.Exonic == "exonic", ]
+plot(x = analysis_exonic$Aggregate.SpliceAI, y = analysis_exonic$patho)
+glm.fit=glm(analysis_exonic$patho ~ analysis_exonic$Aggregate.SpliceAI, family=binomial)
+lines(analysis_exonic$Aggregate.SpliceAI, glm.fit$fitted.values)
+par(pty = "s")
+roc(analysis_exonic$patho, glm.fit$fitted.values, plot=TRUE, legacy.axes = TRUE) #0.947
+
+
+# Correlation of in silico predictor scores - Supplemental Figure 11
+
+colnames(analysis)[2] <- "Pangolin"
+colnames(analysis)[36] <- "SpliceAI"
+colnames(analysis)[46] <- "ABSplice"
+analysis$ABSplice <- analysis$ABSplice * -1
+ggpairs(analysis, 
+        columns = c("SpliceAI", "Pangolin", "ABSplice"), c("SpliceAI","Pangolin","ABSplice"))
+
+```
+
+
+
+## Part 7 - ACMG Analysis, Calibration, and Intepretations
+
+### Here we use the assay results to calibrate the strength of functional evidence from our assay using ClinVar annotated variants. 
+
+```{r}
+
+# Perform ACMG Analysis - Figure 5 and Supplemental Table 5
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header=TRUE)
+
+P_LP <- analysis[analysis$ClinVar.Clinical.Significance == "P" | analysis$ClinVar.Clinical.Significance == "P/LP" | analysis$ClinVar.Clinical.Significance == "LP", ]
+B_LB <- analysis[analysis$ClinVar.Clinical.Significance == "B" | analysis$ClinVar.Clinical.Significance == "B/LB" | analysis$ClinVar.Clinical.Significance == "LB", ]
+VUS <- analysis[analysis$ClinVar.Clinical.Significance == "VUS", ]
+CI <- analysis[analysis$ClinVar.Clinical.Significance == "CI", ]
+
+# Plot standard deviations of benign and pathogenic for Supplemental Figure 4
+# This step determines functional assay evidence strength within the ACMG framework 
+
+# Analysis of sd's and thresholds
+mean_benign <- mean(analysis_benign$delta_psi_norm)
+x <- as.vector(analysis_benign$delta_psi_norm)
+sd_benign <- sd(x)
+low_cutoff <- mean_benign - (1*sd_benign)
+upper_cutoff <- mean_benign + (3*sd_benign)
+
+# Violin plot of B/LB standard deviations - used in Figures 5A and 5B
+
+analysis_test <- analysis
+analysis_test$delta_psi_norm <- analysis$delta_psi_norm * -1
+
+g <- ggplot(analysis_test, aes(ClinVar.Clinical.Significance, delta_psi_norm))
+g + geom_violin() + geom_jitter(width=0.10, alpha=0.5) +
+    geom_hline(yintercept = mean_benign, linetype = "dashed") +
+    geom_hline(yintercept = mean_benign + (1*sd_benign), linetype = "dashed") +
+    geom_hline(yintercept = mean_benign + (2*sd_benign), linetype = "dashed") +
+    geom_hline(yintercept = mean_benign + (3*sd_benign), linetype = "dashed") +
+    ylim(-0.5,1.0) +
+    labs(title="SD Thresholds of B/LB variant delta PSI norm.", 
+         x="Control Variants",
+         y="Normalized Change in PSI")
+
+# Violin plot of all categories 
+analysis$delta_psi_norm <- analysis$delta_psi_norm * -1
+analysis_blb <- analysis[analysis$cDNA.Change %in% benign_controls, ]
+analysis_blb$control <- NA
+analysis_blb$control <- "Benign"
+analysis_plp <- analysis[analysis$cDNA.Change %in% pathogenic_controls, ]
+analysis_plp$control <- NA
+analysis_plp$control <- "Pathogenic"
+analysis_controls <- rbind(analysis_blb, analysis_plp)
+g <- ggplot(analysis_controls, aes(control, delta_psi_norm))
+g + geom_violin() + geom_jitter(width=0.10, alpha=0.5) +
+    geom_hline(yintercept = -0.021, linetype = "dashed") +
+    geom_hline(yintercept = -0.191, linetype = "dashed") +
+    geom_hline(yintercept = -0.361, linetype = "dashed") +
+    geom_hline(yintercept = -0.531, linetype = "dashed") +
+    ylim(-1.0,0.5) +
+    labs(title="Distribution of B/LB variants", 
+         x="Control Variants",
+         y="Normalized Change in PSI")
+
+
+# Apply ACMG criteria - leaves blanks as NA and set to 0 at the end - Supplemental Table 5 - data used in figures 5C and 5D
+
+acmg_input <- read.csv('parse_acmg_interpretation_input.csv', header = TRUE)
+acmg_input_v2 <- merge(acmg_input, analysis, by="ID")
+acmg_input <- acmg_input_v2
+acmg_input$PS3 <- NA
+acmg_input[acmg_input$patho == 1, "PS3"] <- 1
+
+acmg_input$BS3 <- NA
+acmg_input[acmg_input$patho == 0 & acmg_input$MutType == "synonymous", "BS3"] <- 1
+acmg_input[acmg_input$patho == 0 & acmg_input$MutType == "intronic", "BS3"] <- 1
+
+acmg_input$PM2 <- NA
+acmg_input[acmg_input$Allele.Frequency < 0.000025, "PM2"] <- 1
+
+acmg_input$PP3 <- NA
+acmg_input[!is.na(acmg_input$Aggregate.SpliceAI) & acmg_input$Aggregate.SpliceAI >= 0.5, "PP3"] <- 1
+
+acmg_input$BP4 <- NA
+acmg_input[!is.na(acmg_input$Aggregate.SpliceAI) & acmg_input$Aggregate.SpliceAI <= 0.2, "BP4"] <- 1
+
+acmg_output <- acmg_input
+acmg_output[is.na(acmg_output)] <- 0
+
+write.csv(acmg_output, 'parse_acmg_interpretation_output.csv')
+
+
+```
+
+
+## Part 8 - Downstream analyses: automated patch-clamp and RNA-seq
+
+### Here we analyze ParSE-seq and APC data (see previous publication for details - PMID: 32533946)
+
+```{r}
+
+# Load file
+
+analysis <- read.csv('cm_analysis_norm_v4.csv', header=TRUE)
+
+# Analyze missense variants in iPSC-CM dataset 
+
+analysis2 <- analysis[analysis$MutType == "missense", ]
+analysis3 <- analysis2[!is.na(analysis2$patho), ]
+analysis3 <- analysis3[analysis3$patho == 1, ]
+unique(analysis3$Protein.Change)
+
+
+
+# Plot raw splicing PSI - exon 23 is #309 and A1407G is #246 - Figure 6B and Figure 6C
+
+SP_analysis2 <- read.csv('ParSE-seq_PSI_A1407G.csv', header = TRUE)
+p <- ggplot(SP_analysis2, aes(x=Mutation, y=PSI)) + 
+  geom_violin() +
+  ylim(0,100)
+p + geom_jitter(shape=16, position=position_jitter(0.2))
+
+# Quantifications of splicing for Figure 6B were performed in Unix quantifying exon truncation reads via 'grep' searches
+
+
+# Plot raw SP data as barplot - Figure 6D
+
+SP_analysis3 <- read.csv('ParSE-seq - Source Code - Figure 6D.csv', header = TRUE)
+SP_analysis3$sqrt_density <- sqrt(SP_analysis3$PeakDensityNorm)
+SP_analysis3 <- SP_analysis3[, c("Mutation", "PeakInclude", "sqrt_density")]
+SP_analysis3$Mutation <- factor(SP_analysis3$Mutation, levels = c("WT", "A1407G"))
+ggplot(SP_analysis3) +
+    geom_bar(aes(x=Mutation, y=sqrt_density), stat="identity", fill="skyblue", alpha=0.7)
+
+
+
+
+```
+
+
+### SyncroPatch Data for Missense Variants - Supplemental Figure 14 and Supplemental Table 6
+
+```{r}
+
+##### Example act, inact, rfi, late plots #####
+
+# Raw traces from the SyncroPatch were used to make Figure 6E using the activation protocol before
+
+##### IV Curve WT + A1407G + T1131I
+
+allAct=read.csv('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/Old_SP5-81/SP5-81_allCells_act.csv',stringsAsFactors=FALSE)
+class(allAct$PeakDensity)='numeric'
+class(allAct$PeakInclude)='logical'
+allAct[allAct$Mutation=='WT2','Mutation']='WT'
+allAct[allAct$Mutation=='WT3','Mutation']='WT'
+sum(allAct$Mutation=='WT')
+
+a2=allAct[allAct$PeakInclude,]
+a2=a2[a2$Plate=='SP71B' | a2$Plate=='SP81C' | a2$Plate=='SP79D' | a2$Plate=='SP80A',]
+a3=a2[a2$Mutation=='WT' | a2$Mutation=='T1131I' | a2$Mutation=='A1407G',]
+a3=a3[!a3$Type=='jump',]
+plot(a3$Peak,a3$VHalfAct)
+#a3=a3[a3$Peak>=-4000e-12,]
+plot(a3$Peak,a3$VHalfAct,pch='.')
+mutList=unique(a3$Mutation)
+peakDensity_forPlot=calcAndPlotPeakDensityIV(a3,mutList)
+#peakDensity_forPlot_withNones=calcAndPlotPeakDensityIV(b3,mutList)
+write.csv(peakDensity_forPlot,'~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/peakDensity_ParSE_v2.csv',row.names = FALSE)
+#write.csv(peakDensity_forPlot_withNones,'~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/peakDensity_forPlot_withNones.csv',row.names = FALSE)
+
+
+# Make IV plots for ACMG Case studies 
+peakDensity_forPlot=read.csv('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/peakDensity_ParSE_v2.csv',stringsAsFactors = FALSE)
+pdf('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/peakDensityPlots_ParSE_VandyOnly.pdf')
+# WT only
+IV_voltages=seq(-80,60,5)
+#mut='WT'
+#dataMean=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation==mut,6:34])
+#dataSE=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation==mut,35:63])
+#plot(IV_voltages,dataMean,pch=20,xlab='Voltage (mV)',ylab='Current Density (pA/pF)',cex=1,ylim=c(-200,20),main=mut)
+#segments(x0=IV_voltages,y0=(dataMean-dataSE),x1=IV_voltages,y1=(dataMean+dataSE),lwd=1.5)
+#segments(IV_voltages-1,dataMean-dataSE,IV_voltages+1,dataMean-dataSE,lwd=1.5)
+#segments(IV_voltages-1,dataMean+dataSE,IV_voltages+1,dataMean+dataSE,lwd=1.5)
+#abline(h=0)
+
+
+# Math
+dataMean_WT=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='WT',6:34])
+dataSE_WT=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='WT',35:63])
+
+dataMean_T1131I=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='T1131I',6:34])
+dataSE_T1131I=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='T1131I',35:63])
+#F892I_peak=min(dataMean_F892I) #-22.2, so 12%, should be 8.7%, so *.7
+dataMean_A1407G=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='A1407G',6:34])
+dataSE_A1407G=as.numeric(peakDensity_forPlot[peakDensity_forPlot$Mutation=='A1407G',35:63])
+
+
+
+
+plot(IV_voltages,dataMean_WT,pch=20,xlab='Voltage (mV)',ylab='Current Density (pA/pF)',cex=1.5,ylim=c(-220,20),main='Case Studies')
+segments(x0=IV_voltages,y0=(dataMean_WT-dataSE_WT),x1=IV_voltages,y1=(dataMean_WT+dataSE_WT),lwd=1.5)
+points(IV_voltages,dataMean_T1131I,pch=1,xlab='Voltage (mV)',cex=1.1,main=mut,col='00BA38')
+segments(x0=IV_voltages,y0=(dataMean_T1131I-dataSE_T1131I),x1=IV_voltages,y1=(dataMean_T1131I+dataSE_T1131I),lwd=1.5,col='00BA38')
+abline(h=0)
+points(IV_voltages,dataMean_A1407G,pch=1,xlab='Voltage (mV)',cex=1.1,main=mut,col='2E3192')
+segments(x0=IV_voltages,y0=(dataMean_A1407G-dataSE_A1407G),x1=IV_voltages,y1=(dataMean_A1407G+dataSE_A1407G),lwd=1.5,col='2E3192')
+dev.off()
+
+
+##### ACTIVATION WT + A1407G + T1131I.#####
+
+i=read.csv('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/Old_SP5-81/SP5-81_allCells_act.csv',stringsAsFactors=FALSE)
+i[i$Mutation=='WT2','Mutation']='WT'
+i[i$Mutation=='WT3','Mutation']='WT'
+
+i_A1407G=i[i$Mutation=='A1407G' & i$VHalfActInclude,]
+sum(i_A1407G$VHalfActInclude) #6 cells
+i_A1407G$Peak > (-2e-09)
+
+i_T1131I=i[i$Mutation=='T1131I' & i$VHalfActInclude,]
+
+
+# VHalfAct summary (cells with peak below 2000 pA)
+i_good=i[i$VHalfActInclude & i$Peak > (-2e-09),] #10664
+i_good=i[i$VHalfActInclude,] #10664
+i_wtgood=i_good[i_good$Mutation=='WT',] #1165
+i2_good=filterOutliers(i_good,'VHalfAct',i_wtgood$VHalfAct,2.5) #10604
+i3=calcActivation(i2_good,minPeakForAct=-100e-12,errorCutoff=0.1,IV_voltages=seq(-80,15,5),reversalPotential=45.26055,firstCol=20,peakCol='Peak',outfile='~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/allActTraces_SP5-81.pdf',replaceWithNorm=TRUE)
+i3=i3[i3$Plate=='SP71B' | i3$Plate=='SP81C' | i3$Plate=='SP79D' | i3$Plate=='SP80A',]
+
+mutList=c('WT','A1407G', 'T1131I')
+pdf('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/WT_ParseMutants_actCurve.pdf')
+for(mut in mutList){
+  #data=i3[i3$Mutation==mut,23:51]
+  data=i3[i3$Mutation==mut,23:43]
+  print(mut)
+  print(dim(data))
+  dataMean=sapply(data,mean,na.rm=TRUE)
+  if(!mut=='WT'){
+    dataMean=sapply(data,mean,na.rm=TRUE)
+  }
+  library('plotrix')
+  dataSE=sapply(data,std.error,na.rm=TRUE)
+  #IV_voltages=seq(-80,60,5)
+  IV_voltages=seq(-80,20,5)
+  plot(IV_voltages,dataMean,pch=20,xlab='Voltage (mV)',ylab='Normalized Current Density',cex=2.5,main=mut,ylim=c(-.1,1.1))
+  #plot(IV_voltages,dataMean,pch=20,xlab='Voltage (mV)',ylab='Normalized Current Density',cex=1,main=mut)
+  segments(x0=IV_voltages,y0=(dataMean-dataSE),x1=IV_voltages,y1=(dataMean+dataSE),lwd=1.5)
+  #segments(IV_voltages-1,dataMean-dataSE,IV_voltages+1,dataMean-dataSE,lwd=1.5)
+  #segments(IV_voltages-1,dataMean+dataSE,IV_voltages+1,dataMean+dataSE,lwd=1.5)
+  abline(h=0)
+  abline(h=1)
+}
+dev.off()
+
+##### INACTIVATION #####
+i=read.csv('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/Old_SP5-81/SP5-81_allCells_inact.csv',stringsAsFactors=FALSE)
+i[i$Mutation=='WT2','Mutation']='WT'
+i[i$Mutation=='WT3','Mutation']='WT'
+
+# VHalfInact summary
+i_good=i[i$VHalfInactInclude,] #1678
+i_wtgood=i_good[i_good$Mutation=='WT',] #269
+i2_good=filterOutliers(i_good,'VHalfInact',i_wtgood$VHalfInact,3) #1655
+
+i3=calcInactivation(i2_good,inactCutoff=-100e-12,errorCutoff=0.1,Inact_voltages=seq(-160,10,5),firstCol=27,peakCol='Peak_Inact',outpdf='~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/allInactTraces.pdf',replaceWithNorm=TRUE)
+i3=i3[i3$Plate=='SP71B' | i3$Plate=='SP81C' | i3$Plate=='SP79D' | i3$Plate=='SP80A',]
+
+i3=i3[i3$Mutation=='WT' | i3$Mutation=='T1131I' | i3$Mutation=='A1407G',]
+
+mutList=c('WT','A1407G', 'T1131I')
+pdf('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/WT_ParseMutants_inactCurve.pdf')
+for(mut in mutList){
+  print(mut)
+  data=i3[i3$Mutation==mut,30:64]
+  print(dim(data))
+  dataMean=sapply(data,mean,na.rm=TRUE)
+  library('plotrix')
+  dataSE=sapply(data,std.error,na.rm=TRUE)
+  IV_voltages2=seq(-160,10,5)
+  plot(IV_voltages2,dataMean,pch=20,xlab='Voltage (mV)',ylab='Normalized Current Density',cex=1,main=mut,ylim=c(-.1,1.1),xlim=c(-160,-30),col='black')
+  segments(x0=IV_voltages2,y0=(dataMean-dataSE),x1=IV_voltages2,y1=(dataMean+dataSE),lwd=1.5,col='black')
+  #segments(IV_voltages-1,dataMean-dataSE,IV_voltages+1,dataMean-dataSE,lwd=1.5)
+  #segments(IV_voltages-1,dataMean+dataSE,IV_voltages+1,dataMean+dataSE,lwd=1.5)
+  abline(h=0)
+  abline(h=1)
+}
+dev.off()
+
+
+#####  RFI #####
+i=read.csv('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/SP5-81_allCells_rfi.csv',stringsAsFactors=FALSE)
+i[i$Mutation=='WT2','Mutation']='WT'
+i[i$Mutation=='WT3','Mutation']='WT'
+
+# RFI summary
+i_good=i[i$rfiInclude,] #1678
+i_wtgood=i_good[i_good$Mutation=='WT',] #269
+#i2_good=i_good
+i2_good=filterOutliers(i_good,'rfi50',i_wtgood$rfi50,3) #1655
+RFI_times=c(1:10,seq(15,50,5),75,100,200)
+
+i3=calcRFI(i2_good,firstACol=51,Brange=75:95,pdfname='~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/Parse_allRFITraces.pdf',errorCutoff=0.1,RFI_times=RFI_times)
+i3=i3[i3$Plate=='SP71B' | i3$Plate=='SP81C' | i3$Plate=='SP79D' | i3$Plate=='SP80A',]
+
+mutList=c('WT','A1407G', 'T1131I')
+pdf('~/Dropbox/Andrew-Matthew/Syncropatch/CombinedAnalysis/WT_ParseMutants_rfiCurve.pdf')
+for(mut in mutList){
+  print(mut)
+  data=i3[i3$Mutation==mut,79:99]
+  print(dim(data))
+  dataMean=sapply(data,mean,na.rm=TRUE)
+  library('plotrix')
+  dataSE=sapply(data,std.error,na.rm=TRUE)
+  plot(RFI_times,dataMean,pch=20,xlab='Time (ms)',ylab='Normalized Current Density',cex=1,main=mut,ylim=c(-.1,1.1),log='x')
+  segments(x0=RFI_times,y0=(dataMean-dataSE),x1=RFI_times,y1=(dataMean+dataSE),lwd=1.5)
+  #segments(log10(RFI_times)-.02,dataMean-dataSE,log10(RFI_times)+.02,dataMean-dataSE,lwd=1.5)
+  #segments(log10(RFI_times)-.02,dataMean+dataSE,log10(RFI_times)+.02,dataMean+dataSE,lwd=1.5)
+  abline(h=0)
+  abline(h=1)
+}
+dev.off()
+
+```
+
+
+###  ParSE-seq and RNA-seq quantification of aberrant splicing for Supplemental Figures 16D and 16E
+
+```{r}
+
+parse_seq_1891 <- read.csv('parse_1891_percents.csv', header = TRUE)
+
+#SP_analysis2$Construct <- factor(SP_analysis2$Construct, levels = c("Exon 19", "T1131I", "Exon 23", "A1407G"))
+ggplot(parse_seq_1891) +
+    geom_bar(aes(x=Sample, y=Mean_PSI), stat="identity", fill="skyblue", alpha=0.7) +
+    ylim(0, 1) +
+    geom_errorbar( aes(x=Sample, ymin=Mean_PSI-SE, ymax=Mean_PSI+SE), width=0.3, colour="orange", alpha=0.9, size=0.5)
+    
+# stacked barplot
+rna_seq <- read.csv('parse_rna_seq_quantification_v1.csv', header=TRUE)
+rna_seq$Sample <- factor(rna_seq$Sample, levels = c("WT_DMSO", "WT_CHX", "HET_DMSO", "HET_CHX"))
+ggplot(rna_seq, aes(fill= Outcome, y=Fraction, x=Sample)) + 
+    geom_bar(position="stack", stat="identity")
+
+```
+
+
+
+
+
